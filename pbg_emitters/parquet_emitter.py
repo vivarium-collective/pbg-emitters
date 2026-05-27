@@ -836,6 +836,63 @@ def flatten_dict(d: dict, separator: str = "__", prefix: str = "") -> dict:
     return out
 
 
+def _is_bookkeeping_field(name: str) -> bool:
+    """Predicate for structured-array sub-fields that are not analysis-interesting.
+
+    When a numpy structured (record) array is split into per-field columns
+    by :func:`_split_structured_arrays`, certain sub-fields are dropped to
+    keep the per-row column count manageable. These tend to be allocator-
+    or accounting-related fields that explode in width when projected as
+    list columns but are only useful in-process.
+
+    The dropped sub-field name patterns are common conventions in
+    cell-simulation contexts (e.g. mass-balance bookkeeping on bulk
+    molecule counts and per-instance metadata arrays):
+
+    - ``*_submass`` — per-row mass-delta columns commonly attached to
+      bulk-molecule structured arrays
+    - ``massDiff_*`` — per-instance mass-delta columns commonly attached
+      to per-molecule metadata arrays
+    - ``_entryState`` — internal allocator tombstone / liveness flag
+
+    Callers that want every field preserved should not call
+    :func:`_split_structured_arrays`.
+    """
+    return (
+        name.endswith("_submass")
+        or name.startswith("massDiff_")
+        or name == "_entryState"
+    )
+
+
+def _split_structured_arrays(flat: dict) -> dict:
+    """Project numpy structured-record arrays into separate per-field columns.
+
+    Polars cannot write a numpy structured (record) array as a single
+    column, but it handles ``list[T]`` per-row just fine — so each
+    non-bookkeeping field of the structured array becomes its own
+    ``<key>__<field>`` entry. Bookkeeping fields (see
+    :func:`_is_bookkeeping_field`) are dropped.
+
+    Example: a structured array with dtype ``[('id', 'i8'), ('count', 'i8')]``
+    stored under key ``'bulk'`` is projected to
+    ``{'bulk__id': id_array, 'bulk__count': count_array}``.
+
+    Non-structured values (scalars, plain ndarrays, lists, etc.) pass
+    through unchanged.
+    """
+    out: dict = {}
+    for k, v in flat.items():
+        if isinstance(v, np.ndarray) and v.dtype.fields is not None:
+            for f in (v.dtype.names or ()):
+                if _is_bookkeeping_field(f):
+                    continue
+                out[f"{k}__{f}"] = v[f]
+            continue
+        out[k] = v
+    return out
+
+
 def pl_dtype_from_ndarray(arr: np.ndarray) -> pl.DataType:
     """
     Get Polars data type for a Numpy array, including nested lists.
@@ -995,6 +1052,7 @@ class ParquetEmitter(Emitter):
           collapse to ``pl.Null``.
         """
         flat = flatten_dict(state, separator=self.flatten_separator)
+        flat = _split_structured_arrays(flat)
         overrides = self.dtype_overrides
         emit_idx = self.num_emits % self.batch_size
 

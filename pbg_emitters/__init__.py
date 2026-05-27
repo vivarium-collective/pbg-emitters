@@ -41,6 +41,8 @@ try:
         np_dtype,
         union_pl_dtypes,
         flatten_dict,
+        _is_bookkeeping_field,
+        _split_structured_arrays,
         json_to_parquet,
         pl_dtype_from_ndarray,
         open_arbitrary_sim_data,

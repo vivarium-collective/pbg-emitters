@@ -30,6 +30,8 @@ except ImportError as e:  # pragma: no cover - skip whole module without extra
 
 from pbg_emitters.parquet_emitter import (
     ParquetEmitter,
+    _is_bookkeeping_field,
+    _split_structured_arrays,
     create_duckdb_conn,
     flatten_dict,
     list_columns,
@@ -343,6 +345,80 @@ class TestHelperFunctions:
 
 
 # ============================================================================
+# Structured-array splitting helpers.
+# ============================================================================
+
+
+class TestSplitStructuredArrays:
+    def test_split_structured_arrays_explodes_record_array(self):
+        """Each non-bookkeeping field of a structured array becomes its own column."""
+        rec = np.array(
+            [(1, 10), (2, 20)], dtype=[("id", "i8"), ("count", "i8")]
+        )
+        out = _split_structured_arrays({"bulk": rec})
+
+        assert set(out.keys()) == {"bulk__id", "bulk__count"}
+        np.testing.assert_array_equal(out["bulk__id"], np.array([1, 2], dtype="i8"))
+        np.testing.assert_array_equal(out["bulk__count"], np.array([10, 20], dtype="i8"))
+
+    def test_split_structured_arrays_drops_bookkeeping_fields(self):
+        """Fields matching ``_is_bookkeeping_field`` are silently dropped."""
+        rec = np.array(
+            [(1, 10, 0.5, 1.0, 1), (2, 20, 0.6, 2.0, 0)],
+            dtype=[
+                ("id", "i8"),
+                ("count", "i8"),
+                ("protein_submass", "f8"),
+                ("massDiff_water", "f8"),
+                ("_entryState", "i1"),
+            ],
+        )
+        out = _split_structured_arrays({"unique": rec})
+
+        assert set(out.keys()) == {"unique__id", "unique__count"}
+        assert "unique__protein_submass" not in out
+        assert "unique__massDiff_water" not in out
+        assert "unique__massDiff_" not in out
+        assert "unique___entryState" not in out
+
+    def test_split_structured_arrays_passthrough_non_structured(self):
+        """Scalars, lists, and plain (non-record) ndarrays pass through unchanged."""
+        plain = np.array([1, 2, 3], dtype=np.int32)
+        flat = {
+            "scalar": 42,
+            "string": "hello",
+            "list_of_ints": [1, 2, 3],
+            "plain_ndarray": plain,
+            "ratio": 0.75,
+            "bool_value": True,
+        }
+        out = _split_structured_arrays(flat)
+
+        assert set(out.keys()) == set(flat.keys())
+        assert out["scalar"] == 42
+        assert out["string"] == "hello"
+        assert out["list_of_ints"] == [1, 2, 3]
+        # Plain ndarray must be the same object (no copy on passthrough).
+        assert out["plain_ndarray"] is plain
+        assert out["ratio"] == 0.75
+        assert out["bool_value"] is True
+
+    def test_is_bookkeeping_field_patterns(self):
+        """Pattern coverage for the predicate."""
+        assert _is_bookkeeping_field("protein_submass")
+        assert _is_bookkeeping_field("_submass")
+        assert _is_bookkeeping_field("massDiff_water")
+        assert _is_bookkeeping_field("massDiff_")
+        assert _is_bookkeeping_field("_entryState")
+        # Non-matches.
+        assert not _is_bookkeeping_field("id")
+        assert not _is_bookkeeping_field("count")
+        assert not _is_bookkeeping_field("submass_count")  # not the suffix
+        assert not _is_bookkeeping_field("entryState")     # missing leading "_"
+        assert not _is_bookkeeping_field("MassDiff_x")     # case-sensitive
+
+
+# ============================================================================
 # Integration tests — exercise ParquetEmitter through update/query/close.
 # ============================================================================
 
@@ -438,6 +514,47 @@ class TestParquetEmitterIntegration:
             "experiment_id=sentinel_exp", "s.pq",
         )
         assert os.path.exists(sentinel), f"missing sentinel: {sentinel}"
+
+    def test_parquet_emitter_handles_structured_bulk_state(self, temp_dir, core):
+        """End-to-end: a structured-array field is split into per-field columns."""
+        emitter = ParquetEmitter(
+            config={
+                "out_dir": temp_dir,
+                "batch_size": 4,
+                "threaded": False,
+                "metadata": {"experiment_id": "structured"},
+            },
+            core=core,
+        )
+        emitter.last_batch_future.result()
+
+        bulk_dtype = [
+            ("id", "i8"),
+            ("count", "i8"),
+            ("protein_submass", "f8"),  # bookkeeping — must be dropped
+        ]
+        emitter.update({
+            "time": 1.0,
+            "bulk": np.array([(1, 10, 0.5), (2, 20, 0.6)], dtype=bulk_dtype),
+        })
+        emitter.update({
+            "time": 2.0,
+            "bulk": np.array([(1, 11, 0.7), (2, 21, 0.8)], dtype=bulk_dtype),
+        })
+        emitter.close(success=False)
+
+        df = emitter.query().sort("time")
+
+        # Structured array exploded into per-field columns; bookkeeping dropped.
+        assert "bulk__id" in df.columns
+        assert "bulk__count" in df.columns
+        assert "bulk" not in df.columns
+        assert "bulk__protein_submass" not in df.columns
+
+        assert df["time"].to_list() == [1.0, 2.0]
+        # The exploded fields land as list[T] per row.
+        assert df["bulk__id"].to_list() == [[1, 2], [1, 2]]
+        assert df["bulk__count"].to_list() == [[10, 20], [11, 21]]
 
     def test_ragged_array_polars_fallback(self, temp_dir, core):
         """A field whose shape changes mid-batch falls back to the Polars list path."""
