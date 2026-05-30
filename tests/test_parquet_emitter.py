@@ -481,14 +481,20 @@ class TestParquetEmitterIntegration:
         assert df_sorted["ratio"].to_list() == [0.5, 0.75, 1.0]
 
     def test_round_trip_quantity_unit_bearing_port(self, temp_dir, core):
-        """A pint.Quantity (a ``quantity[...]`` port value) is serialized via
-        the core into {units, magnitude}, flattened into scalar columns, and
-        read back — instead of crashing ``pl.Series`` on numpy object dtype.
+        """A pint.Quantity (a ``quantity[...]`` port value) is stripped to its
+        magnitude under the SAME column name, and the unit is recorded as
+        Parquet file metadata — instead of crashing ``pl.Series`` on numpy
+        object dtype, and without renaming the column.
 
-        Regression: before ``coerce_rich_values`` the emitter did
-        ``pl.Series([Quantity(...)])`` and raised
-        ``cannot parse numpy data type dtype('O')``.
+        Regression: a Quantity made ``pl.Series([Quantity(...)])`` raise
+        ``cannot parse numpy data type dtype('O')``. The column-name
+        preservation matters so downstream name-based queries / reports keep
+        working when a port is promoted to a unit-bearing type.
         """
+        import glob
+        import json
+
+        import pyarrow.parquet as pq
         from bigraph_schema.units import units as ureg
 
         emitter = ParquetEmitter(
@@ -507,13 +513,21 @@ class TestParquetEmitterIntegration:
         emitter.close(success=False)
 
         df = emitter.query().sort("time")
-        # Quantity is split by flatten_dict into a magnitude column plus one
-        # column per unit symbol (default "__" separator).
-        assert "rate__magnitude" in df.columns, df.columns
-        assert df["rate__magnitude"].to_list() == [10.0, 20.0]
-        # The unit travels with the data (gram^1 · liter^-1).
-        assert df["rate__units__gram"].to_list() == [1, 1]
-        assert df["rate__units__liter"].to_list() == [-1, -1]
+        # Column name preserved (NOT renamed to rate__magnitude); holds the
+        # plain-float magnitudes.
+        assert "rate" in df.columns, df.columns
+        assert "rate__magnitude" not in df.columns, df.columns
+        assert df["rate"].to_list() == [10.0, 20.0]
+        # Unit captured in-memory and persisted to Parquet file metadata.
+        assert emitter.column_units.get("rate") == "gram / liter"
+        files = glob.glob(
+            os.path.join(temp_dir, "quantity_port", "history", "**", "*.pq"),
+            recursive=True,
+        )
+        assert files, "no history parquet written"
+        kv = pq.read_metadata(files[0]).metadata or {}
+        column_units = json.loads(kv[b"column_units"])
+        assert column_units["rate"] == "gram / liter"
 
     def test_close_writes_partial_batch_and_success_sentinel(self, temp_dir, core):
         """close(success=True) flushes the trailing batch + writes the sentinel."""

@@ -15,6 +15,7 @@ Requires the ``[parquet]`` extra (``duckdb``, ``polars``, ``pyarrow``,
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 from concurrent.futures import Future, ThreadPoolExecutor, Executor
 from typing import Any, Callable, Mapping, Optional, cast
@@ -84,6 +85,7 @@ def json_to_parquet(
     outfile: str,
     schema: dict[str, Any],
     filesystem: AbstractFileSystem,
+    metadata: dict[str, str] | None = None,
 ):
     """Convert dictionary to Parquet.
 
@@ -94,6 +96,8 @@ def json_to_parquet(
         schema: Full mapping of column names to Polars dtypes.
         filesystem: On local filesystem, fsspec filesystem needed to
             write Parquet file atomically.
+        metadata: Optional file-level Parquet key/value metadata (e.g. the
+            unit string for each unit-bearing column).
     """
     tbl = pl.DataFrame(emit_dict, schema={k: schema[k] for k in emit_dict})
     # GCS should have atomic uploads, but on a local filesystem, DuckDB may fail
@@ -104,6 +108,8 @@ def json_to_parquet(
         temp_outfile = outfile + ".tmp"
     tbl.write_parquet(
         temp_outfile,
+        # File-level key/value metadata (column units, etc.).
+        metadata=metadata or None,
         # Increase retry attempts to handle S3/GCS failures
         storage_options={"max_retries": 50, "retry_timeout_ms": 300000},
     )
@@ -905,41 +911,45 @@ def pl_dtype_from_ndarray(arr: np.ndarray) -> pl.DataType:
     return pl_dtype
 
 
-def coerce_rich_values(value: Any, core: Any) -> Any:
-    """Route framework-rich leaf values through the core's serializers.
+def _is_quantity(value: Any) -> bool:
+    """Duck-type a ``pint.Quantity`` without importing pint.
 
-    The numpy/Polars buffering paths can only store native scalars/arrays.
-    A value carrying units at runtime — a ``pint.Quantity`` wired to a
-    ``quantity[...]`` port — is numpy ``object`` dtype and makes
-    ``pl.Series([v])`` raise ``cannot parse numpy data type dtype('O')``.
-
-    Rather than special-case each rich type, hand any non-native leaf to
-    ``core.serialize`` (using the schema ``core.infer`` reports for the
-    value), which yields a JSON-safe structure the registered serializer
-    defines. A ``Quantity`` becomes ``{'units': {...}, 'magnitude': <n>}``,
-    which the caller's ``flatten_dict`` then splits into scalar columns
-    (``…__magnitude``, ``…__units__<symbol>``). Native values pass through
-    untouched, so the hot numpy path is unaffected for the common case.
-
-    The emit schema is anyized to ``node`` (see
-    ``process_bigraph.emitter.anyize_paths``), so the value's own type — not
-    the declared port schema — drives serialization here.
+    A unit-bearing value exposes ``magnitude``, ``units`` and
+    ``dimensionality``; plain floats / numpy arrays / lists do not.
     """
-    if isinstance(value, dict):
-        return {k: coerce_rich_values(v, core) for k, v in value.items()}
-    # Duck-type a pint.Quantity without importing pint: it exposes a
-    # magnitude, units, and dimensionality. Plain floats / numpy arrays
-    # do not, so they skip straight through.
-    if (
+    return (
         hasattr(value, "magnitude")
         and hasattr(value, "units")
         and hasattr(value, "dimensionality")
-    ):
-        schema = core.infer(value)
-        if isinstance(schema, tuple):
-            schema = schema[0]
-        return core.serialize(schema, value)
-    return value
+    )
+
+
+def strip_quantities(flat: dict[str, Any], column_units: dict[str, str]) -> dict[str, Any]:
+    """Replace unit-bearing leaves with their magnitude, recording the unit.
+
+    The numpy/Polars buffering paths can only store native scalars/arrays.
+    A ``pint.Quantity`` wired to a ``quantity[...]`` port is numpy ``object``
+    dtype and makes ``pl.Series([v])`` raise ``cannot parse numpy data type
+    dtype('O')``.
+
+    Operating on the already-flattened dict, each ``Quantity`` leaf is
+    replaced by its ``.magnitude`` **under the same column name** (so
+    downstream queries / reports / visualizations that read the column by
+    name keep working unchanged), and its unit string is recorded in
+    ``column_units`` to be written as Parquet file metadata. This is the key
+    difference from emitting ``{units, magnitude}`` and letting
+    ``flatten_dict`` split it into ``…__magnitude`` / ``…__units__<sym>``
+    columns — that renames the column and breaks name-based consumers.
+
+    The emit schema is anyized to ``node`` (``process_bigraph.emitter
+    .anyize_paths``), so the value's own type drives this — not the declared
+    port schema. Native values are left untouched (hot path unaffected).
+    """
+    for k, v in list(flat.items()):
+        if _is_quantity(v):
+            column_units.setdefault(k, str(v.units))
+            flat[k] = v.magnitude
+    return flat
 
 
 class ParquetEmitter(Emitter):
@@ -999,6 +1009,10 @@ class ParquetEmitter(Emitter):
         self.pl_types: dict[str, pl.DataType | DataTypeClass] = {}
         self.np_types: dict[str, Any] = {}
         self.pl_serialized: set[str] = set()
+        # column name -> unit string, captured when a quantity[...] port emits
+        # a pint.Quantity; written as Parquet file metadata so the unit travels
+        # with the data without renaming the (magnitude-valued) column.
+        self.column_units: dict[str, str] = {}
         self.num_emits: int = 0
         self.last_batch_future: Future = Future()
         self.last_batch_future.set_result(None)
@@ -1068,6 +1082,18 @@ class ParquetEmitter(Emitter):
         except (FileNotFoundError, OSError):
             pass
 
+    def _history_metadata(self) -> dict[str, str] | None:
+        """File-level Parquet metadata for history files.
+
+        Carries the unit string for each unit-bearing (``quantity[...]``)
+        column under the ``column_units`` key, JSON-encoded, so the unit
+        travels with the data without renaming the magnitude-valued column.
+        ``None`` when no unit-bearing columns have been emitted.
+        """
+        if not self.column_units:
+            return None
+        return {"column_units": json.dumps(self.column_units)}
+
     def update(self, state: dict[str, Any]) -> dict:
         """Buffer one history row; flush to parquet when ``batch_size`` reached.
 
@@ -1087,12 +1113,14 @@ class ParquetEmitter(Emitter):
           provide a ``force_inner`` hint so e.g. all-null prefixes don't
           collapse to ``pl.Null``.
         """
-        # Normalise framework-rich leaves (e.g. pint.Quantity on a
-        # quantity[...] port) into JSON-safe structures before flattening,
-        # so the numpy/Polars buffering paths only ever see native data.
-        state = coerce_rich_values(state, self.core)
         flat = flatten_dict(state, separator=self.flatten_separator)
         flat = _split_structured_arrays(flat)
+        # Unit-bearing leaves (pint.Quantity on a quantity[...] port) are numpy
+        # object dtype and can't go through the numpy/Polars paths. Strip each
+        # to its magnitude under the SAME column name (downstream name-based
+        # queries keep working) and record the unit, written as Parquet file
+        # metadata at flush.
+        flat = strip_quantities(flat, self.column_units)
         overrides = self.dtype_overrides
         emit_idx = self.num_emits % self.batch_size
 
@@ -1173,6 +1201,7 @@ class ParquetEmitter(Emitter):
                 outfile,
                 self.pl_types,
                 self.filesystem,
+                self._history_metadata(),
             )
             # Clear buffers so the background writer can't be racing with
             # the next batch's writes into the same arrays.
@@ -1203,6 +1232,7 @@ class ParquetEmitter(Emitter):
         self.filesystem.makedirs(os.path.dirname(outfile), exist_ok=True)
         self.last_batch_future = self.executor.submit(
             json_to_parquet, trimmed, outfile, self.pl_types, self.filesystem,
+            self._history_metadata(),
         )
         self.buffered_emits = {}
 
