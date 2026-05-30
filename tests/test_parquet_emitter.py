@@ -480,6 +480,55 @@ class TestParquetEmitterIntegration:
         assert df_sorted["value"].to_list() == [10, 20, 30]
         assert df_sorted["ratio"].to_list() == [0.5, 0.75, 1.0]
 
+    def test_round_trip_quantity_unit_bearing_port(self, temp_dir, core):
+        """A pint.Quantity (a ``quantity[...]`` port value) is stripped to its
+        magnitude under the SAME column name, and the unit is recorded as
+        Parquet file metadata — instead of crashing ``pl.Series`` on numpy
+        object dtype, and without renaming the column.
+
+        Regression: a Quantity made ``pl.Series([Quantity(...)])`` raise
+        ``cannot parse numpy data type dtype('O')``. The column-name
+        preservation matters so downstream name-based queries / reports keep
+        working when a port is promoted to a unit-bearing type.
+        """
+        import glob
+        import json
+
+        import pyarrow.parquet as pq
+        from bigraph_schema.units import units as ureg
+
+        emitter = ParquetEmitter(
+            config={
+                "out_dir": temp_dir,
+                "batch_size": 2,
+                "threaded": False,
+                "metadata": {"experiment_id": "quantity_port"},
+            },
+            core=core,
+        )
+        emitter.last_batch_future.result()
+
+        emitter.update({"time": 1.0, "rate": ureg.Quantity(10.0, "gram / liter")})
+        emitter.update({"time": 2.0, "rate": ureg.Quantity(20.0, "gram / liter")})
+        emitter.close(success=False)
+
+        df = emitter.query().sort("time")
+        # Column name preserved (NOT renamed to rate__magnitude); holds the
+        # plain-float magnitudes.
+        assert "rate" in df.columns, df.columns
+        assert "rate__magnitude" not in df.columns, df.columns
+        assert df["rate"].to_list() == [10.0, 20.0]
+        # Unit captured in-memory and persisted to Parquet file metadata.
+        assert emitter.column_units.get("rate") == "gram / liter"
+        files = glob.glob(
+            os.path.join(temp_dir, "quantity_port", "history", "**", "*.pq"),
+            recursive=True,
+        )
+        assert files, "no history parquet written"
+        kv = pq.read_metadata(files[0]).metadata or {}
+        column_units = json.loads(kv[b"column_units"])
+        assert column_units["rate"] == "gram / liter"
+
     def test_close_writes_partial_batch_and_success_sentinel(self, temp_dir, core):
         """close(success=True) flushes the trailing batch + writes the sentinel."""
         emitter = ParquetEmitter(
