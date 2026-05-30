@@ -480,6 +480,41 @@ class TestParquetEmitterIntegration:
         assert df_sorted["value"].to_list() == [10, 20, 30]
         assert df_sorted["ratio"].to_list() == [0.5, 0.75, 1.0]
 
+    def test_round_trip_quantity_unit_bearing_port(self, temp_dir, core):
+        """A pint.Quantity (a ``quantity[...]`` port value) is serialized via
+        the core into {units, magnitude}, flattened into scalar columns, and
+        read back — instead of crashing ``pl.Series`` on numpy object dtype.
+
+        Regression: before ``coerce_rich_values`` the emitter did
+        ``pl.Series([Quantity(...)])`` and raised
+        ``cannot parse numpy data type dtype('O')``.
+        """
+        from bigraph_schema.units import units as ureg
+
+        emitter = ParquetEmitter(
+            config={
+                "out_dir": temp_dir,
+                "batch_size": 2,
+                "threaded": False,
+                "metadata": {"experiment_id": "quantity_port"},
+            },
+            core=core,
+        )
+        emitter.last_batch_future.result()
+
+        emitter.update({"time": 1.0, "rate": ureg.Quantity(10.0, "gram / liter")})
+        emitter.update({"time": 2.0, "rate": ureg.Quantity(20.0, "gram / liter")})
+        emitter.close(success=False)
+
+        df = emitter.query().sort("time")
+        # Quantity is split by flatten_dict into a magnitude column plus one
+        # column per unit symbol (default "__" separator).
+        assert "rate__magnitude" in df.columns, df.columns
+        assert df["rate__magnitude"].to_list() == [10.0, 20.0]
+        # The unit travels with the data (gram^1 · liter^-1).
+        assert df["rate__units__gram"].to_list() == [1, 1]
+        assert df["rate__units__liter"].to_list() == [-1, -1]
+
     def test_close_writes_partial_batch_and_success_sentinel(self, temp_dir, core):
         """close(success=True) flushes the trailing batch + writes the sentinel."""
         emitter = ParquetEmitter(

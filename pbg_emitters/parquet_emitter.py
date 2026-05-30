@@ -905,6 +905,42 @@ def pl_dtype_from_ndarray(arr: np.ndarray) -> pl.DataType:
     return pl_dtype
 
 
+def coerce_rich_values(value: Any, core: Any) -> Any:
+    """Route framework-rich leaf values through the core's serializers.
+
+    The numpy/Polars buffering paths can only store native scalars/arrays.
+    A value carrying units at runtime — a ``pint.Quantity`` wired to a
+    ``quantity[...]`` port — is numpy ``object`` dtype and makes
+    ``pl.Series([v])`` raise ``cannot parse numpy data type dtype('O')``.
+
+    Rather than special-case each rich type, hand any non-native leaf to
+    ``core.serialize`` (using the schema ``core.infer`` reports for the
+    value), which yields a JSON-safe structure the registered serializer
+    defines. A ``Quantity`` becomes ``{'units': {...}, 'magnitude': <n>}``,
+    which the caller's ``flatten_dict`` then splits into scalar columns
+    (``…__magnitude``, ``…__units__<symbol>``). Native values pass through
+    untouched, so the hot numpy path is unaffected for the common case.
+
+    The emit schema is anyized to ``node`` (see
+    ``process_bigraph.emitter.anyize_paths``), so the value's own type — not
+    the declared port schema — drives serialization here.
+    """
+    if isinstance(value, dict):
+        return {k: coerce_rich_values(v, core) for k, v in value.items()}
+    # Duck-type a pint.Quantity without importing pint: it exposes a
+    # magnitude, units, and dimensionality. Plain floats / numpy arrays
+    # do not, so they skip straight through.
+    if (
+        hasattr(value, "magnitude")
+        and hasattr(value, "units")
+        and hasattr(value, "dimensionality")
+    ):
+        schema = core.infer(value)
+        if isinstance(schema, tuple):
+            schema = schema[0]
+        return core.serialize(schema, value)
+    return value
+
 
 class ParquetEmitter(Emitter):
     """Generic Parquet emitter, hive-partitioned per ``partitioning_keys``.
@@ -1051,6 +1087,10 @@ class ParquetEmitter(Emitter):
           provide a ``force_inner`` hint so e.g. all-null prefixes don't
           collapse to ``pl.Null``.
         """
+        # Normalise framework-rich leaves (e.g. pint.Quantity on a
+        # quantity[...] port) into JSON-safe structures before flattening,
+        # so the numpy/Polars buffering paths only ever see native data.
+        state = coerce_rich_values(state, self.core)
         flat = flatten_dict(state, separator=self.flatten_separator)
         flat = _split_structured_arrays(flat)
         overrides = self.dtype_overrides
