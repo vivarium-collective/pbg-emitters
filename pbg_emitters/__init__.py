@@ -7,6 +7,17 @@ package never forces the heavy dependencies. Install only what you need::
     pip install 'pbg-emitters[parquet]'   # ParquetEmitter (duckdb, polars, ...)
 """
 
+# Per-agent emitter-lifecycle registry. Pure stdlib (no heavy deps), so it
+# imports unconditionally regardless of which emitter extras are installed.
+from pbg_emitters.lifecycle import (
+    register_emitter,
+    get_emitter,
+    unregister_emitter,
+    clear_registry,
+    registered_agent_ids,
+    finalize_emitter_for_agent,
+)
+
 try:
     from pbg_emitters.sqlite_emitter import (
         SQLiteEmitter,
