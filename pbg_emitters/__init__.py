@@ -61,3 +61,8 @@ try:
     )
 except ImportError:
     pass  # [parquet] extra not installed
+
+try:
+    from pbg_emitters.xarray_emitter import XArrayEmitter  # noqa: F401
+except ImportError:
+    pass  # [xarray] extra not installed

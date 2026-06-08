@@ -26,6 +26,13 @@ parquet = [
     "fsspec",
     "tqdm",
 ]
+xarray = [
+    "xarray>=2026.04",
+    "zarr~=3.1.6",
+    "zarrs>=0.2",
+    "pint",
+    "unum",
+]
 dev = [
     "pytest",
     "duckdb",
@@ -33,6 +40,11 @@ dev = [
     "pyarrow",
     "fsspec",
     "tqdm",
+    "xarray>=2026.04",
+    "zarr~=3.1.6",
+    "zarrs>=0.2",
+    "pint",
+    "unum",
 ]
 
 [tool.setuptools.packages.find]
