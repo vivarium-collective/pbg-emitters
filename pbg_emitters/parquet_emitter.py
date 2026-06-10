@@ -1293,15 +1293,26 @@ class ParquetEmitter(Emitter):
         When the emitter is wired into a process-bigraph composite step, no
         explicit ``close()`` call happens at composite end-of-life — the step
         instance gets garbage-collected and any trailing partial batch is
-        lost. ``__del__`` calls ``close(success=False)`` so the trailing
-        rows land on disk. Interpreter-shutdown ordering is undefined, so
-        callers that care about the success sentinel or about durable
-        flushes during normal operation should still call ``close()``
-        explicitly.
+        lost. ``__del__`` flushes the trailing rows so they land on disk.
+        Callers that care about the success sentinel or about durable flushes
+        during normal operation should still call ``close()`` explicitly.
+
+        NON-BLOCKING by design: a finalizer must never block. GC can invoke
+        ``__del__`` re-entrantly at an arbitrary moment — e.g. while a *later*
+        composite is being built and the interpreter is mid type-dispatch —
+        and ``close()``'s ``last_batch_future.result()`` wait deadlocks there
+        (the awaited write can't make progress because the calling thread is
+        the one stuck in __del__). So instead of ``close()``, we submit the
+        trailing batch and shut the pool down *without* waiting; the
+        ThreadPoolExecutor's own atexit join still lands the write before the
+        interpreter exits.
         """
         try:
             if not getattr(self, "_closed", True):
-                self.close(success=False)
+                self._closed = True
+                self._flush_partial_batch()
+                if isinstance(self.executor, ThreadPoolExecutor):
+                    self.executor.shutdown(wait=False)
         except Exception:
             # Never raise from __del__ — Python emits "Exception ignored in"
             # warnings for that and it pollutes test output / logs.

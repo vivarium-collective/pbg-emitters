@@ -453,6 +453,37 @@ class TestParquetEmitterIntegration:
         with pytest.raises(ValueError, match="out_dir.*out_uri"):
             ParquetEmitter(config={"threaded": False}, core=core)
 
+    def test_del_is_non_blocking_on_pending_future(self, temp_dir, core):
+        """``__del__`` must never block on ``last_batch_future``.
+
+        GC can invoke ``__del__`` re-entrantly at an arbitrary moment (e.g.
+        mid type-dispatch while a *later* composite is being built); waiting on
+        the write future there deadlocks. Regression for that hang: the
+        finalizer must return promptly even when the future never resolves.
+        """
+        import threading
+        from concurrent.futures import Future
+
+        e = ParquetEmitter(
+            config={"out_dir": temp_dir, "threaded": True}, core=core,
+        )
+        e.last_batch_future.result()  # let construction settle
+        # Deadlock condition: a write future that never resolves on an open
+        # emitter. Stub the flush so the pending future stays in place.
+        e._flush_partial_batch = lambda: None
+        e.last_batch_future = Future()  # pending forever
+        e._closed = False
+
+        done = threading.Event()
+        threading.Thread(
+            target=lambda: (type(e).__del__(e), done.set()), daemon=True
+        ).start()
+        assert done.wait(timeout=5.0), (
+            "__del__ blocked on last_batch_future — a finalizer must not wait "
+            "on a write future (it can be called re-entrantly during GC)"
+        )
+        assert e._closed is True
+
     def test_round_trip_basic(self, temp_dir, core):
         """Emit a few rows of mixed types and read them back via query()."""
         emitter = ParquetEmitter(
