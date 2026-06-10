@@ -17,6 +17,19 @@ import polars as pl
 
 
 # ---------------------------------------------------------------------------
+# Public error types
+# ---------------------------------------------------------------------------
+
+
+class IdNotInCatalog(KeyError):
+    """An element id was not found in the observable's name catalog."""
+
+
+class CatalogUnavailable(LookupError):
+    """A name catalog is required but not present for this observable/backend."""
+
+
+# ---------------------------------------------------------------------------
 # Public data types
 # ---------------------------------------------------------------------------
 
@@ -199,6 +212,56 @@ def _sim_ids_to_gen_map(sim_ids: list[str]) -> dict[str, int]:
     for i, sid in enumerate(sim_ids):
         result[sid] = _parse_gen_from_sim_id(sid, i)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Series reduction helper
+# ---------------------------------------------------------------------------
+
+
+def _reduce_series(dfs: list[pl.DataFrame], op: str) -> pl.DataFrame:
+    """Reduce a list of ``[generation, time, abs_time, value]`` DataFrames.
+
+    All DataFrames must share the same ``(generation, time, abs_time)`` index.
+    Supported ops: ``"sum"``, ``"mean"``, ``"max"``, ``"min"``.
+    """
+    _empty = pl.DataFrame({
+        "generation": pl.Series([], dtype=pl.Int64),
+        "time":       pl.Series([], dtype=pl.Float64),
+        "abs_time":   pl.Series([], dtype=pl.Float64),
+        "value":      pl.Series([], dtype=pl.Float64),
+    })
+    if not dfs:
+        return _empty
+    if len(dfs) == 1:
+        return dfs[0]
+
+    base = dfs[0].rename({"value": "v0"})
+    for i, df in enumerate(dfs[1:], 1):
+        base = base.join(
+            df.select(["generation", "time", "abs_time",
+                       pl.col("value").alias(f"v{i}")]),
+            on=["generation", "time", "abs_time"],
+            how="inner",
+        )
+
+    vcols = [pl.col(f"v{i}") for i in range(len(dfs))]
+    if op == "sum":
+        val_expr = pl.sum_horizontal(*vcols)
+    elif op == "mean":
+        val_expr = pl.mean_horizontal(*vcols)
+    elif op == "max":
+        val_expr = pl.max_horizontal(*vcols)
+    elif op == "min":
+        val_expr = pl.min_horizontal(*vcols)
+    else:
+        raise ValueError(f"Unknown reduce op: {op!r}")
+
+    return (
+        base
+        .with_columns(val_expr.alias("value"))
+        .select(["generation", "time", "abs_time", "value"])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -420,16 +483,22 @@ class RunReader:
     # Parquet backend
     # ------------------------------------------------------------------
 
-    def _parquet_conn_sql(self):
-        """Return (duckdb_conn, history_sql) for this store."""
-        # Lazy import — only when parquet backend is needed
-        from pbg_emitters.parquet_emitter import create_duckdb_conn, dataset_sql
+    def _parquet_all_sql(self):
+        """Return ``(conn, history_sql, config_sql)``; result is cached."""
+        if not hasattr(self, "_pq_cache"):
+            from pbg_emitters.parquet_emitter import create_duckdb_conn, dataset_sql
 
-        p = Path(self._ref.store)
-        out_dir = str(p.parent)
-        exp_id = p.name
-        conn = create_duckdb_conn()
-        history_sql, _, _ = dataset_sql(out_dir, [exp_id])
+            p = Path(self._ref.store)
+            out_dir = str(p.parent)
+            exp_id = p.name
+            conn = create_duckdb_conn()
+            history_sql, config_sql, _ = dataset_sql(out_dir, [exp_id])
+            self._pq_cache = (conn, history_sql, config_sql)
+        return self._pq_cache
+
+    def _parquet_conn_sql(self):
+        """Return ``(conn, history_sql)`` — backward-compatible shim."""
+        conn, history_sql, _ = self._parquet_all_sql()
         return conn, history_sql
 
     def _parquet_observables(self) -> list[str]:
@@ -474,6 +543,127 @@ class RunReader:
                 generation,
                 {time_col} AS time,
                 {quoted_col} AS value
+            FROM ({history_sql})
+            ORDER BY generation, {time_col}
+        """
+        df = conn.sql(query).pl()
+        df = df.with_columns(
+            pl.col("generation").cast(pl.Int64),
+            pl.col("time").cast(pl.Float64),
+            pl.col("value").cast(pl.Float64),
+        )
+        df = _cumulative_time(df)
+        return df.select(["generation", "time", "abs_time", "value"])
+
+    def _parquet_catalog(self, observable: str) -> list | None:
+        """Return name catalog for *observable* from the parquet store.
+
+        * ``"bulk"`` → reads the ``bulk__id`` column (first-row constant).
+        * Other observables → reads ``output_metadata__<col>`` from the
+          configuration parquet (written by :func:`parquet_emitter.field_metadata`).
+        * Returns ``None`` when no catalog is available.
+        """
+        from pbg_emitters.parquet_emitter import list_columns, METADATA_PREFIX
+
+        conn, history_sql, config_sql = self._parquet_all_sql()
+
+        if observable == "bulk":
+            try:
+                result = conn.sql(
+                    f'SELECT first("bulk__id") FROM ({history_sql})'
+                ).fetchone()
+                if result and result[0] is not None:
+                    return list(result[0])
+            except Exception:
+                pass
+            return None
+
+        # Listener / other vector observables → output_metadata in config.
+        col_key = observable.replace(".", "__")
+        meta_col = METADATA_PREFIX + col_key
+
+        try:
+            config_cols = list_columns(conn, config_sql)
+        except Exception:
+            return None
+
+        if meta_col not in config_cols:
+            return None
+
+        try:
+            result = conn.sql(
+                f'SELECT first("{meta_col}") FROM ({config_sql})'
+            ).fetchone()
+            if result and result[0] is not None:
+                return list(result[0])
+        except Exception:
+            pass
+        return None
+
+    def _parquet_select_element(self, col_name: str, idx: int) -> pl.DataFrame:
+        """Extract the scalar at position *idx* from list column *col_name* per tick."""
+        from pbg_emitters.parquet_emitter import list_columns
+
+        conn, history_sql, _ = self._parquet_all_sql()
+        all_cols = list_columns(conn, history_sql)
+        time_col = "global_time" if "global_time" in all_cols else "time"
+
+        # DuckDB arrays are 1-indexed.
+        query = f"""
+            SELECT
+                generation,
+                {time_col} AS time,
+                "{col_name}"[{idx + 1}] AS value
+            FROM ({history_sql})
+            ORDER BY generation, {time_col}
+        """
+        df = conn.sql(query).pl()
+        df = df.with_columns(
+            pl.col("generation").cast(pl.Int64),
+            pl.col("time").cast(pl.Float64),
+            pl.col("value").cast(pl.Float64),
+        )
+        df = _cumulative_time(df)
+        return df.select(["generation", "time", "abs_time", "value"])
+
+    def _parquet_aggregate_elements(
+        self, col_name: str, indices: list[int], op: str
+    ) -> pl.DataFrame:
+        """Reduce multiple list-column elements in a single DuckDB query."""
+        from pbg_emitters.parquet_emitter import list_columns
+
+        conn, history_sql, _ = self._parquet_all_sql()
+        all_cols = list_columns(conn, history_sql)
+        time_col = "global_time" if "global_time" in all_cols else "time"
+
+        # DuckDB uses 1-indexed array access.
+        elem_exprs = [f'"{col_name}"[{idx + 1}]' for idx in indices]
+
+        if op == "sum":
+            agg_expr = " + ".join(elem_exprs)
+        elif op == "mean":
+            n = float(len(indices))
+            agg_expr = f"({' + '.join(elem_exprs)}) / {n}"
+        elif op == "max":
+            agg_expr = (
+                elem_exprs[0]
+                if len(elem_exprs) == 1
+                else f"greatest({', '.join(elem_exprs)})"
+            )
+        elif op == "min":
+            agg_expr = (
+                elem_exprs[0]
+                if len(elem_exprs) == 1
+                else f"least({', '.join(elem_exprs)})"
+            )
+        else:
+            raise ValueError(f"Unknown op: {op!r}")
+
+        query = f"""
+            SELECT
+                generation,
+                {time_col} AS time,
+                ({agg_expr}) AS value
             FROM ({history_sql})
             ORDER BY generation, {time_col}
         """
@@ -569,3 +759,302 @@ class RunReader:
         df = pl.DataFrame(rows).sort(["generation", "time"])
         df = _cumulative_time(df)
         return df.select(["generation", "time", "abs_time", "value"])
+
+    def _xarray_catalog(self, observable: str) -> list | None:
+        """Return the ``id_<var>`` coordinate values for *observable*, or ``None``."""
+        try:
+            from pbg_emitters.xarray_emitter.storage import VAR_COO_PREFIX
+        except ImportError:
+            return None
+
+        dt = self._xarray_open()
+        node_path = "/" + observable.replace(".", "/")
+        if node_path not in dt.groups:
+            return None
+
+        node_ds = dt[node_path].ds
+        var_name = observable.split(".")[-1]
+        id_coord = f"{VAR_COO_PREFIX}{var_name}"
+        if id_coord in node_ds.coords:
+            return list(node_ds.coords[id_coord].values)
+        return None
+
+    def _xarray_select_element(self, col_name: str, idx: int) -> pl.DataFrame:
+        """Extract element at *idx* from an array observable per tick (XArray)."""
+        observable = col_name.replace("__", ".")
+        dt = self._xarray_open()
+        node_path = "/" + observable.replace(".", "/")
+
+        if node_path not in dt.groups:
+            raise KeyError(observable)
+
+        node_ds = dt[node_path].ds
+        root_ds = dt["/"].ds
+        gen_info = self._xarray_gen_info(dt)
+
+        rows = []
+        for gen, _coo_name, time_var in gen_info:
+            var_name = f"generation={gen}"
+            if var_name not in node_ds.data_vars or time_var not in root_ds.data_vars:
+                continue
+            times = root_ds[time_var].values.ravel()
+            arr = node_ds[var_name].values
+            # 2D (ticks × elements) → take column at idx; 1D fallback.
+            if arr.ndim == 2:
+                values = arr[:, idx]
+            else:
+                values = arr.ravel()
+            for t, v in zip(times, values):
+                rows.append({"generation": gen, "time": float(t), "value": float(v)})
+
+        if not rows:
+            raise KeyError(observable)
+
+        df = pl.DataFrame(rows).sort(["generation", "time"])
+        df = _cumulative_time(df)
+        return df.select(["generation", "time", "abs_time", "value"])
+
+    # ------------------------------------------------------------------
+    # SQLite catalog + element extraction
+    # ------------------------------------------------------------------
+
+    def _sqlite_catalog(self, observable: str) -> list | None:
+        """Return catalog from SQLite ``simulations`` metadata, or ``None``."""
+        try:
+            from pbg_emitters.sqlite_emitter import load_simulation_metadata
+        except ImportError:
+            return None
+
+        rows = self._sqlite_rows()
+        if not rows:
+            return None
+
+        # Try each distinct sim_id (preserve first-seen order).
+        seen: dict[str, None] = {}
+        for r in rows:
+            seen[r[0]] = None
+        db_path = self._ref.store
+
+        for sim_id in seen:
+            try:
+                meta = load_simulation_metadata(db_path, sim_id)
+                if meta is None:
+                    continue
+                output_meta = (meta.get("metadata") or {}).get("output_metadata", {})
+                val = output_meta
+                for part in observable.split("."):
+                    if not isinstance(val, dict):
+                        val = None
+                        break
+                    val = val.get(part, {})
+                if isinstance(val, list) and val:
+                    return val
+            except Exception:
+                continue
+        return None
+
+    def _sqlite_select_element(self, col_name: str, idx: int) -> pl.DataFrame:
+        """Extract element at *idx* from a list-valued observable per tick (SQLite)."""
+        observable = col_name.replace("__", ".")
+        _empty = pl.DataFrame({
+            "generation": pl.Series([], dtype=pl.Int64),
+            "time":       pl.Series([], dtype=pl.Float64),
+            "abs_time":   pl.Series([], dtype=pl.Float64),
+            "value":      pl.Series([], dtype=pl.Float64),
+        })
+
+        rows = self._sqlite_rows()
+        if not rows:
+            return _empty
+
+        sim_ids = sorted(set(r[0] for r in rows))
+        gen_map = _sim_ids_to_gen_map(sim_ids)
+
+        data = []
+        for sim_id, _step, gtime, state in rows:
+            gen = state.get("generation")
+            if gen is None:
+                gen = gen_map.get(sim_id, 0)
+            try:
+                val_list = _dig(state, observable)
+                if not isinstance(val_list, (list, tuple)) or idx >= len(val_list):
+                    continue
+                data.append({
+                    "generation": int(gen),
+                    "time": float(gtime if gtime is not None else 0.0),
+                    "value": float(val_list[idx]),
+                })
+            except (KeyError, TypeError, IndexError):
+                continue
+
+        if not data:
+            return _empty
+
+        df = pl.DataFrame(data).sort(["generation", "time"])
+        df = _cumulative_time(df)
+        return df.select(["generation", "time", "abs_time", "value"])
+
+    # ------------------------------------------------------------------
+    # Backend dispatch helpers
+    # ------------------------------------------------------------------
+
+    def _backend_select_element(self, col_name: str, idx: int) -> pl.DataFrame:
+        """Dispatch single-element extraction to the appropriate backend."""
+        if self._kind == "parquet":
+            return self._parquet_select_element(col_name, idx)
+        if self._kind == "sqlite":
+            return self._sqlite_select_element(col_name, idx)
+        if self._kind == "xarray":
+            return self._xarray_select_element(col_name, idx)
+        raise ValueError(f"Unknown kind: {self._kind!r}")
+
+    # ------------------------------------------------------------------
+    # Public catalog API
+    # ------------------------------------------------------------------
+
+    # Maps index_by.type → (catalog_observable, data_col_name).
+    # ``catalog_observable`` is passed to catalog()/resolve_id() to look up
+    # the element index; ``data_col_name`` is the parquet/sqlite column that
+    # holds the raw array (with ``__`` separators, NOT dots).
+    _SELECT_TYPE_MAP: dict[str, tuple[str, str]] = {
+        "bulk_id": ("bulk", "bulk__count"),
+        "monomer_id": ("listeners.monomer_counts", "listeners__monomer_counts"),
+    }
+
+    def catalog(self, observable: str) -> list | None:
+        """Return the element-name catalog for an array observable, or ``None``.
+
+        Args:
+            observable: Observable id as returned by :py:meth:`observables`
+                (dotted path, e.g. ``"listeners.monomer_counts"``).  Use
+                ``"bulk"`` to get the bulk-molecule id list.
+
+        Returns:
+            Ordered list of element names when a catalog is present,
+            ``None`` otherwise.
+        """
+        if self._kind == "parquet":
+            return self._parquet_catalog(observable)
+        if self._kind == "xarray":
+            return self._xarray_catalog(observable)
+        if self._kind == "sqlite":
+            return self._sqlite_catalog(observable)
+        raise ValueError(f"Unknown kind: {self._kind!r}")
+
+    def resolve_id(self, observable: str, element_id: str) -> int:
+        """Return the 0-based index of *element_id* in the observable's catalog.
+
+        Args:
+            observable: Observable id (dotted path or ``"bulk"``).
+            element_id: Name to look up.
+
+        Returns:
+            0-based integer index.
+
+        Raises:
+            :exc:`CatalogUnavailable`: No catalog exists for this observable.
+            :exc:`IdNotInCatalog`: *element_id* is not in the catalog.
+        """
+        cat = self.catalog(observable)
+        if cat is None:
+            raise CatalogUnavailable(
+                f"No catalog available for {observable!r} in {self._kind!r} store"
+            )
+        try:
+            return cat.index(element_id)
+        except ValueError:
+            raise IdNotInCatalog(
+                f"{element_id!r} not in catalog for {observable!r}"
+            ) from None
+
+    def select(self, index_by: dict) -> pl.DataFrame:
+        """Return a ``[generation, time, abs_time, value]`` series for one element.
+
+        Args:
+            index_by: Selector dict with mandatory key ``"type"`` and ``"value"``.
+
+            Supported types:
+
+            * ``"bulk_id"`` — *value* is a bulk molecule id; observable is
+              ``"bulk"`` / data column ``bulk__count``.
+            * ``"monomer_id"`` — *value* is a monomer name; observable is
+              ``"listeners.monomer_counts"``.
+            * ``"listener_id"`` — *value* is a named element of a listener
+              vector; requires ``"observable"`` key in *index_by*.
+            * ``"literal_index"`` — *value* is a 0-based integer; requires
+              ``"observable"`` key.  No catalog lookup is performed.
+
+        Returns:
+            Polars DataFrame with columns ``[generation, time, abs_time, value]``,
+            same shape as :py:meth:`series`.
+
+        Raises:
+            :exc:`IdNotInCatalog`: Unknown id for catalog-backed types.
+            :exc:`CatalogUnavailable`: Catalog required but absent.
+        """
+        type_ = index_by["type"]
+        value = index_by["value"]
+
+        if type_ == "literal_index":
+            obs = index_by.get("observable")
+            if obs is None:
+                raise ValueError(
+                    "literal_index selector requires 'observable' in index_by"
+                )
+            col_name = obs.replace(".", "__")
+            return self._backend_select_element(col_name, int(value))
+
+        if type_ in self._SELECT_TYPE_MAP:
+            catalog_obs, data_col = self._SELECT_TYPE_MAP[type_]
+            idx = self.resolve_id(catalog_obs, str(value))
+            return self._backend_select_element(data_col, idx)
+
+        if type_ == "listener_id":
+            obs = index_by.get("observable")
+            if not obs:
+                raise ValueError(
+                    "listener_id selector requires 'observable' in index_by"
+                )
+            idx = self.resolve_id(obs, str(value))
+            col_name = obs.replace(".", "__")
+            return self._backend_select_element(col_name, idx)
+
+        raise ValueError(f"Unknown index_by type: {type_!r}")
+
+    def aggregate_series(
+        self, observable: str, op: str, over: list[str]
+    ) -> pl.DataFrame:
+        """Return a per-tick series reduced across named elements.
+
+        Args:
+            observable: Observable id whose catalog will be used to resolve
+                *over* ids (dotted path, e.g. ``"listeners.monomer_counts"``).
+            op: Reduction operator — one of ``"sum"``, ``"mean"``, ``"max"``,
+                ``"min"``.
+            over: Ordered list of element names to include.  **Every** name
+                must exist in the catalog; an unknown name raises
+                :exc:`IdNotInCatalog` (never silently dropped).
+
+        Returns:
+            Polars DataFrame ``[generation, time, abs_time, value]``, same
+            shape as :py:meth:`series`.
+
+        Raises:
+            :exc:`IdNotInCatalog`: Any element in *over* is unknown.
+            :exc:`CatalogUnavailable`: No catalog for *observable*.
+            :exc:`ValueError`: Unknown *op*.
+        """
+        if op not in {"sum", "mean", "max", "min"}:
+            raise ValueError(f"Unknown aggregate op: {op!r}. Use sum/mean/max/min.")
+
+        # Resolve all ids up-front — raises IdNotInCatalog for any unknown.
+        indices = [self.resolve_id(observable, id_) for id_ in over]
+
+        col_name = observable.replace(".", "__")
+
+        if self._kind == "parquet":
+            return self._parquet_aggregate_elements(col_name, indices, op)
+
+        # General fallback: pull per-element series and reduce in polars.
+        dfs = [self._backend_select_element(col_name, idx) for idx in indices]
+        return _reduce_series(dfs, op)
