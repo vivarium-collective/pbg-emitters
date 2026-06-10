@@ -66,3 +66,8 @@ try:
     from pbg_emitters.xarray_emitter import XArrayEmitter  # noqa: F401
 except ImportError:
     pass  # [xarray] extra not installed
+
+try:
+    from pbg_emitters.run_reader import RunReader, RunRef, by_generation  # noqa: F401
+except ImportError:
+    pass  # polars not installed (unlikely — it's a base dep)
