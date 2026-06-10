@@ -9,6 +9,7 @@ inside the backend branches so importing this module does not force extras.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,10 +29,15 @@ class RunRef:
         store: Path to the run's store (hive dir | .db file | .zarr root).
         kind:  Backend kind — ``"parquet"``, ``"sqlite"``, or ``"xarray"``.
                Auto-detected from ``store`` if ``None``.
+        simulation_id: Optional SQLite-specific filter.  When set, only rows
+               with this ``simulation_id`` are read from the history table.
+               Useful when multiple runs share one ``.db`` file and you want
+               to address a single simulation.
     """
 
     store: str
     kind: str | None = None
+    simulation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +84,8 @@ def _cumulative_time(df: pl.DataFrame) -> pl.DataFrame:
         df: Must have ``generation`` (int) and ``time`` (float) columns.
 
     Returns:
-        ``df`` with an additional ``abs_time`` (Float64) column.
+        ``df`` with an additional ``abs_time`` (Float64) column, sorted by
+        ``(generation, time)``.
     """
     if df.is_empty():
         return df.with_columns(pl.lit(0.0).cast(pl.Float64).alias("abs_time"))
@@ -100,6 +107,7 @@ def _cumulative_time(df: pl.DataFrame) -> pl.DataFrame:
         df.join(off_df, on="generation", how="left")
         .with_columns((pl.col("time") + pl.col("_off")).alias("abs_time"))
         .drop("_off")
+        .sort(["generation", "time"])
     )
 
 
@@ -169,13 +177,40 @@ def _flatten_paths(d: dict, prefix: str = "") -> list[str]:
     return paths
 
 
+def _parse_gen_from_sim_id(sim_id: str, fallback: int) -> int:
+    """Try to parse a generation integer from a simulation_id string.
+
+    Matches patterns like ``gen=1``, ``gen_1``, ``gen-1``, ``gen1``
+    (case-insensitive).  Returns ``fallback`` when no pattern is found.
+    """
+    m = re.search(r"gen[=_-]?(\d+)", sim_id, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return fallback
+
+
+def _sim_ids_to_gen_map(sim_ids: list[str]) -> dict[str, int]:
+    """Map each simulation_id to a generation integer.
+
+    Tries to parse generation from the id (``gen=N`` patterns); falls back to
+    0-based insertion order so the result is never empty for a non-empty store.
+    """
+    result: dict[str, int] = {}
+    for i, sid in enumerate(sim_ids):
+        result[sid] = _parse_gen_from_sim_id(sid, i)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # RunReader
 # ---------------------------------------------------------------------------
 
-_PARQUET_ID_COLS = frozenset(
-    {"experiment_id", "variant", "lineage_seed", "generation", "agent_id", "time"}
-)
+_PARQUET_ID_COLS = frozenset({
+    "experiment_id", "variant", "lineage_seed",
+    "generation", "agent_id",
+    "time",        # legacy: real stores use global_time, not time
+    "global_time", # real ParquetEmitter output
+})
 _SQLITE_ID_FIELDS = frozenset({"generation", "global_time"})
 
 
@@ -275,57 +310,95 @@ class RunReader:
     # ------------------------------------------------------------------
 
     def _sqlite_rows(self) -> list[tuple]:
-        """Read all history rows: [(step, global_time, state_dict), ...]."""
-        import sqlite3
+        """Read all history rows: [(simulation_id, step, global_time, state_dict), ...].
+
+        Filters by ``RunRef.simulation_id`` when that attribute is set.
+        Rows are ordered by ``(simulation_id, step)`` so multi-generation
+        databases arrive in a stable, predictable order.
+        """
         import json
+        import sqlite3
 
         con = sqlite3.connect(self._ref.store)
         try:
-            rows = con.execute(
-                "SELECT step, global_time, state FROM history ORDER BY step"
-            ).fetchall()
+            sim_id_filter = self._ref.simulation_id
+            if sim_id_filter is not None:
+                rows = con.execute(
+                    "SELECT simulation_id, step, global_time, state "
+                    "FROM history WHERE simulation_id = ? "
+                    "ORDER BY simulation_id, step",
+                    (sim_id_filter,),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT simulation_id, step, global_time, state "
+                    "FROM history ORDER BY simulation_id, step"
+                ).fetchall()
         finally:
             con.close()
-        return [(step, gtime, json.loads(state)) for step, gtime, state in rows]
+        return [
+            (sim_id, step, gtime, json.loads(state))
+            for sim_id, step, gtime, state in rows
+        ]
 
     def _sqlite_observables(self) -> list[str]:
         rows = self._sqlite_rows()
         if not rows:
             return []
-        _, _, state = rows[0]
+        _, _, _, state = rows[0]
         obs_state = {k: v for k, v in state.items() if k not in _SQLITE_ID_FIELDS}
         return sorted(_flatten_paths(obs_state))
 
     def _sqlite_generations(self) -> list[int]:
         rows = self._sqlite_rows()
-        gens = {
-            state["generation"]
-            for _, _, state in rows
+        if not rows:
+            return []
+
+        # Prefer explicit generation key in state (legacy / custom runner).
+        gen_from_state = {
+            state.get("generation")
+            for _, _, _, state in rows
             if "generation" in state
         }
-        return sorted(int(g) for g in gens)
+        if gen_from_state and None not in gen_from_state:
+            return sorted(int(g) for g in gen_from_state)
+
+        # Fall back: derive generation from DISTINCT simulation_ids.
+        # The real runner names per-gen sims with a gen=N suffix so we can
+        # parse the generation index; if that fails, use 0-based index so we
+        # NEVER return empty for a non-empty history.
+        sim_ids = sorted(set(r[0] for r in rows))
+        gen_map = _sim_ids_to_gen_map(sim_ids)
+        return sorted(set(gen_map.values()))
 
     def _sqlite_series(self, observable: str) -> pl.DataFrame:
+        _empty = pl.DataFrame({
+            "generation": pl.Series([], dtype=pl.Int64),
+            "time": pl.Series([], dtype=pl.Float64),
+            "abs_time": pl.Series([], dtype=pl.Float64),
+            "value": pl.Series([], dtype=pl.Float64),
+        })
         rows = self._sqlite_rows()
         if not rows:
-            return pl.DataFrame({
-                "generation": pl.Series([], dtype=pl.Int64),
-                "time": pl.Series([], dtype=pl.Float64),
-                "abs_time": pl.Series([], dtype=pl.Float64),
-                "value": pl.Series([], dtype=pl.Float64),
-            })
-        # Validate — check first row's state for the observable
-        _, _, first_state = rows[0]
+            return _empty
+
+        # Validate — check observable exists in first row's state.
+        _, _, _, first_state = rows[0]
         try:
             _dig(first_state, observable)
         except KeyError:
             raise KeyError(observable)
 
+        # Build simulation_id → generation mapping once, used for every row.
+        sim_ids = sorted(set(r[0] for r in rows))
+        gen_map = _sim_ids_to_gen_map(sim_ids)
+
         data = []
-        for _, gtime, state in rows:
+        for sim_id, _step, gtime, state in rows:
+            # Prefer explicit generation from state; fall back to derived gen.
             gen = state.get("generation")
             if gen is None:
-                continue
+                gen = gen_map.get(sim_id, 0)
             try:
                 val = _dig(state, observable)
             except KeyError:
@@ -335,8 +408,13 @@ class RunReader:
                 "time": float(gtime if gtime is not None else 0.0),
                 "value": float(val),
             })
+
+        if not data:
+            return _empty
+
         df = pl.DataFrame(data).sort(["generation", "time"])
-        return _cumulative_time(df)
+        df = _cumulative_time(df)
+        return df.select(["generation", "time", "abs_time", "value"])
 
     # ------------------------------------------------------------------
     # Parquet backend
@@ -359,7 +437,11 @@ class RunReader:
 
         conn, history_sql = self._parquet_conn_sql()
         all_cols = list_columns(conn, history_sql)
-        obs_cols = [c for c in all_cols if c not in _PARQUET_ID_COLS]
+        # Exclude partition / id columns and bulk array columns (not scalars).
+        obs_cols = [
+            c for c in all_cols
+            if c not in _PARQUET_ID_COLS and not c.startswith("bulk")
+        ]
         return sorted(c.replace("__", ".") for c in obs_cols)
 
     def _parquet_generations(self) -> list[int]:
@@ -370,35 +452,39 @@ class RunReader:
         return result["generation"].cast(pl.Int64).to_list()
 
     def _parquet_series(self, observable: str) -> pl.DataFrame:
-        from pbg_emitters.parquet_emitter import (
-            list_columns,
-            read_stacked_columns,
-            quote_columns,
-        )
+        from pbg_emitters.parquet_emitter import list_columns
 
         col_name = observable.replace(".", "__")
         conn, history_sql = self._parquet_conn_sql()
 
-        # Validate — check column exists in schema
+        # Validate — check column exists in schema.
         available = list_columns(conn, history_sql, col_name)
         if not available:
             raise KeyError(observable)
 
-        quoted = quote_columns(col_name)
-        df = read_stacked_columns(history_sql, [quoted], conn=conn)
-        # df has columns: [col_name, experiment_id, variant, lineage_seed,
-        #                  generation, agent_id, time]
-        df = (
-            df.select(["generation", "time", col_name])
-            .rename({col_name: "value"})
-            .with_columns(
-                pl.col("generation").cast(pl.Int64),
-                pl.col("time").cast(pl.Float64),
-                pl.col("value").cast(pl.Float64),
-            )
-            .sort(["generation", "time"])
+        # Detect whether the store uses 'global_time' (real emitter) or 'time'
+        # (older / hand-built stores).  Select it aliased to 'time' so the
+        # returned DataFrame always has a 'time' column regardless of origin.
+        all_cols = list_columns(conn, history_sql)
+        time_col = "global_time" if "global_time" in all_cols else "time"
+
+        quoted_col = f'"{col_name}"'
+        query = f"""
+            SELECT
+                generation,
+                {time_col} AS time,
+                {quoted_col} AS value
+            FROM ({history_sql})
+            ORDER BY generation, {time_col}
+        """
+        df = conn.sql(query).pl()
+        df = df.with_columns(
+            pl.col("generation").cast(pl.Int64),
+            pl.col("time").cast(pl.Float64),
+            pl.col("value").cast(pl.Float64),
         )
-        return _cumulative_time(df)
+        df = _cumulative_time(df)
+        return df.select(["generation", "time", "abs_time", "value"])
 
     # ------------------------------------------------------------------
     # XArray backend
@@ -481,4 +567,5 @@ class RunReader:
             raise KeyError(observable)
 
         df = pl.DataFrame(rows).sort(["generation", "time"])
-        return _cumulative_time(df)
+        df = _cumulative_time(df)
+        return df.select(["generation", "time", "abs_time", "value"])

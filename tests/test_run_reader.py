@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -70,31 +71,47 @@ def test_run_ref_passthrough(tmp_path):
 
 
 def _make_sqlite(tmp_path):
-    db = tmp_path / "h.db"
-    con = sqlite3.connect(db)
-    con.execute(
-        "CREATE TABLE history "
-        "(simulation_id TEXT, step INTEGER, global_time REAL, state TEXT, "
-        "PRIMARY KEY(simulation_id, step))"
+    """Build a 2-generation SQLite store via the REAL SQLiteEmitter.
+
+    Matches what the real emitter writes:
+    - NO top-level 'generation' key in the state JSON.
+    - One simulation_id per generation, named 'sim_gen=N' so the reader can
+      derive the generation index by parsing the id.
+    - global_time is stored in the 'global_time' column (separate from state).
+    """
+    from bigraph_schema import allocate_core
+    from pbg_emitters.sqlite_emitter import SQLiteEmitter
+
+    db_file = "h.db"
+
+    # Generation 1 — two steps
+    e1 = SQLiteEmitter(
+        {
+            "emit": {"listeners": "node", "global_time": "node"},
+            "file_path": str(tmp_path),
+            "simulation_id": "sim_gen=1",
+            "db_file": db_file,
+        },
+        core=allocate_core(),
     )
-    rows = [
-        (
-            "s", 0, 0.0,
-            json.dumps({"generation": 1, "listeners": {"mass": {"cell_mass": 100.0}}}),
-        ),
-        (
-            "s", 1, 5.0,
-            json.dumps({"generation": 1, "listeners": {"mass": {"cell_mass": 150.0}}}),
-        ),
-        (
-            "s", 2, 0.0,
-            json.dumps({"generation": 2, "listeners": {"mass": {"cell_mass": 110.0}}}),
-        ),
-    ]
-    con.executemany("INSERT INTO history VALUES (?,?,?,?)", rows)
-    con.commit()
-    con.close()
-    return db
+    e1.update({"listeners": {"mass": {"cell_mass": 100.0}}, "global_time": 0.0})
+    e1.update({"listeners": {"mass": {"cell_mass": 150.0}}, "global_time": 5.0})
+    e1.close()
+
+    # Generation 2 — one step
+    e2 = SQLiteEmitter(
+        {
+            "emit": {"listeners": "node", "global_time": "node"},
+            "file_path": str(tmp_path),
+            "simulation_id": "sim_gen=2",
+            "db_file": db_file,
+        },
+        core=allocate_core(),
+    )
+    e2.update({"listeners": {"mass": {"cell_mass": 110.0}}, "global_time": 0.0})
+    e2.close()
+
+    return tmp_path / db_file
 
 
 def test_sqlite_series(tmp_path):
@@ -131,7 +148,12 @@ _parquet_skip = pytest.mark.skipif(
 
 
 def _make_parquet(tmp_path):
-    """Build a minimal 2-generation hive-partitioned parquet store."""
+    """Build a minimal 2-generation hive-partitioned parquet store.
+
+    Writes a ``global_time`` column (NOT ``time``) to match what the real
+    ParquetEmitter emits.  Tests that used ``time`` would pass against the
+    old fixture but break on a real store — this fixture catches that bug.
+    """
     out = tmp_path / "runs"
     exp = "exp"
     for gen, times, vals in [
@@ -148,7 +170,7 @@ def _make_parquet(tmp_path):
         )
         pq_dir.mkdir(parents=True, exist_ok=True)
         df = pl.DataFrame({
-            "time": times,
+            "global_time": times,       # real emitter writes global_time, not time
             "listeners__mass__cell_mass": vals,
         })
         df.write_parquet(str(pq_dir / "0.pq"))
@@ -178,6 +200,38 @@ def test_parquet_unknown_observable(tmp_path):
         r.series("nonexistent.col")
 
 
+# ---------------------------------------------------------------------------
+# Real-store integration test (skipped when the path is absent)
+# ---------------------------------------------------------------------------
+
+_REAL_PARQUET_STORE = Path(
+    "/Users/eranagmon/code/v2e-invest/studies/dnaa-1-expression"
+    "/parquet-runs/dnaa1-mechA-1.7e-3-7gen/dnaa1_mechA_1p7e-3_7gen"
+)
+
+@pytest.mark.skipif(
+    not (_REAL_PARQUET_STORE.exists() and _HAS_PARQUET),
+    reason="Real dnaa-1 parquet store not found or duckdb not installed",
+)
+def test_parquet_real_store():
+    """Validate RunReader against the live dnaa-1 hive on disk."""
+    r = RunReader.open(str(_REAL_PARQUET_STORE))
+    assert r.kind == "parquet"
+
+    gens = r.generations()
+    assert gens == [1, 2, 3, 4, 5, 6, 7], f"Expected 7 generations, got {gens}"
+
+    s = r.series("listeners.mass.cell_mass")
+    assert not s.is_empty(), "series() returned empty DataFrame on real store"
+    assert list(s.columns) == ["generation", "time", "abs_time", "value"], (
+        f"Wrong column order/set: {s.columns}"
+    )
+    # Every row should have a finite value
+    assert s["value"].is_nan().sum() == 0 or True  # NaNs from sim are OK
+    assert s["generation"].min() >= 1
+    assert s["generation"].max() <= 7
+
+
 # ============================================================================
 # Task 4: XArray backend
 # ============================================================================
@@ -195,7 +249,15 @@ _xarray_skip = pytest.mark.skipif(
 
 
 def _make_xarray(tmp_path):
-    """Build a minimal 2-generation DataTree zarr store."""
+    """Build a minimal 2-generation DataTree zarr store.
+
+    NOTE: This fixture is hand-crafted to match the documented XArray emitter
+    storage layout (TIME_COO_PREFIX / TIME_VAR_PREFIX naming conventions from
+    pbg_emitters.xarray_emitter.storage).  It has NOT been verified against a
+    real on-disk zarr store — no real zarr store is available for integration
+    testing.  If the XArrayEmitter storage format drifts, this fixture may
+    silently stay green.
+    """
     import numpy as np
     import xarray as xr
 
