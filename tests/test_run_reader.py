@@ -292,8 +292,10 @@ def test_by_generation(tmp_path):
 @_parquet_skip
 def test_cross_backend_equivalence(tmp_path):
     """SQLite and Parquet backends return identical series for the same data."""
-    # SQLite store
-    sqlite_path = _make_sqlite(tmp_path / "sq")
+    # SQLite store (directory must exist first)
+    sq_dir = tmp_path / "sq"
+    sq_dir.mkdir()
+    sqlite_path = _make_sqlite(sq_dir)
     # Parquet store with the same data
     parquet_store = _make_parquet(tmp_path / "pq")
 
