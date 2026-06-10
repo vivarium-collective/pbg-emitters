@@ -921,6 +921,35 @@ class RunReader:
         "monomer_id": ("listeners.monomer_counts", "listeners__monomer_counts"),
     }
 
+    # Maps catalog observable name → raw data column name (``__``-separated).
+    # Used by aggregate_series to resolve the correct data column for observables
+    # whose catalog name differs from their data column name (e.g. "bulk" whose
+    # count data lives in "bulk__count", not "bulk").
+    _OBSERVABLE_DATA_COL_MAP: dict[str, str] = {
+        "bulk": "bulk__count",
+    }
+
+    def _resolve_observable_col(self, observable: str) -> tuple[str, str]:
+        """Return ``(catalog_observable, data_col_name)`` for *observable*.
+
+        For most observables the data column is simply
+        ``observable.replace('.', '__')``.  Special cases (e.g. ``"bulk"``)
+        are handled via :attr:`_OBSERVABLE_DATA_COL_MAP`.
+
+        Args:
+            observable: Dotted observable name (e.g. ``"bulk"``,
+                ``"listeners.monomer_counts"``).
+
+        Returns:
+            ``(catalog_observable, data_col_name)`` where *catalog_observable*
+            is passed to :py:meth:`resolve_id` and *data_col_name* is the raw
+            column name used by the backend (``__``-separated, no dots).
+        """
+        data_col = self._OBSERVABLE_DATA_COL_MAP.get(
+            observable, observable.replace(".", "__")
+        )
+        return observable, data_col
+
     def catalog(self, observable: str) -> list | None:
         """Return the element-name catalog for an array observable, or ``None``.
 
@@ -1047,10 +1076,13 @@ class RunReader:
         if op not in {"sum", "mean", "max", "min"}:
             raise ValueError(f"Unknown aggregate op: {op!r}. Use sum/mean/max/min.")
 
-        # Resolve all ids up-front — raises IdNotInCatalog for any unknown.
-        indices = [self.resolve_id(observable, id_) for id_ in over]
+        # Resolve catalog observable and data column — handles cases where the
+        # catalog observable name differs from the raw data column (e.g. "bulk"
+        # whose count data lives in "bulk__count", not "bulk").
+        catalog_obs, col_name = self._resolve_observable_col(observable)
 
-        col_name = observable.replace(".", "__")
+        # Resolve all ids up-front — raises IdNotInCatalog for any unknown.
+        indices = [self.resolve_id(catalog_obs, id_) for id_ in over]
 
         if self._kind == "parquet":
             return self._parquet_aggregate_elements(col_name, indices, op)

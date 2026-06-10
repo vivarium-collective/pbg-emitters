@@ -308,6 +308,99 @@ def test_aggregate_series_unknown_id_raises(tmp_path):
 
 
 # ============================================================================
+# Task 3b: aggregate_series for bulk observable (review bug fix)
+# ============================================================================
+
+# Bulk synthetic constants
+_BULK_IDS = ["ATP[c]", "GTP[c]", "CTP[c]"]
+# gen=1: t=0 → [100,200,300]; t=5 → [110,210,310]
+# gen=2: t=0 → [120,220,320]
+_BULK_GEN1 = [[100.0, 200.0, 300.0], [110.0, 210.0, 310.0]]
+_BULK_GEN2 = [[120.0, 220.0, 320.0]]
+
+
+def _make_bulk_parquet(tmp_path):
+    """Synthetic hive with bulk__id catalog and bulk__count data columns."""
+    out = tmp_path / "bulk_runs"
+    exp = "exp"
+
+    for gen, times, counts in [
+        (1, [0.0, 5.0], _BULK_GEN1),
+        (2, [0.0], _BULK_GEN2),
+    ]:
+        pq_dir = (
+            out / exp / "history"
+            / f"experiment_id={exp}"
+            / "variant=0"
+            / "lineage_seed=0"
+            / f"generation={gen}"
+            / "agent_id=0"
+        )
+        pq_dir.mkdir(parents=True, exist_ok=True)
+        df = pl.DataFrame({
+            "global_time": pl.Series(times, dtype=pl.Float64),
+            "bulk__id": pl.Series([_BULK_IDS] * len(times), dtype=pl.List(pl.String)),
+            "bulk__count": pl.Series(counts, dtype=pl.List(pl.Float64)),
+        })
+        df.write_parquet(str(pq_dir / "0.pq"))
+
+    return out / exp
+
+
+@_parquet_skip
+def test_aggregate_series_bulk_synthetic(tmp_path):
+    """aggregate_series('bulk','sum') uses bulk__count, not 'bulk' (review bug)."""
+    store = _make_bulk_parquet(tmp_path)
+    r = RunReader.open(str(store))
+
+    # Sanity: individual selects work
+    atp_df = r.select({"type": "bulk_id", "value": "ATP[c]"}).sort(["generation", "time"])
+    gtp_df = r.select({"type": "bulk_id", "value": "GTP[c]"}).sort(["generation", "time"])
+    expected = (atp_df["value"] + gtp_df["value"]).to_list()
+
+    # This must not raise BinderException
+    agg = r.aggregate_series("bulk", "sum", over=["ATP[c]", "GTP[c]"])
+    agg = agg.sort(["generation", "time"])
+    assert list(agg.columns) == ["generation", "time", "abs_time", "value"]
+    # gen1 t=0: 100+200=300; t=5: 110+210=320; gen2 t=0: 120+220=340
+    assert agg["value"].to_list() == pytest.approx([300.0, 320.0, 340.0])
+    assert agg["value"].to_list() == pytest.approx(expected)
+
+
+@_parquet_skip
+def test_aggregate_series_bulk_all_three_synthetic(tmp_path):
+    """aggregate_series('bulk','sum') over all 3 bulk ids = element-wise sum of selects."""
+    store = _make_bulk_parquet(tmp_path)
+    r = RunReader.open(str(store))
+
+    # sum of all three: [100+200+300, 110+210+310, 120+220+320] = [600, 630, 660]
+    agg = r.aggregate_series("bulk", "sum", over=_BULK_IDS)
+    agg = agg.sort(["generation", "time"])
+    assert agg["value"].to_list() == pytest.approx([600.0, 630.0, 660.0])
+
+
+@_real_skip
+def test_aggregate_series_bulk_real_hive():
+    """aggregate_series('bulk','sum') on real hive matches sum of individual selects."""
+    r = RunReader.open(str(_REAL_PARQUET_STORE))
+    bulk_ids = ["ATP[c]", "ATP[p]", "ATP[e]"]
+
+    # Individual selects (the known-working path)
+    dfs = [
+        r.select({"type": "bulk_id", "value": bid}).sort(["generation", "time"])
+        for bid in bulk_ids
+    ]
+    expected_sum = (dfs[0]["value"] + dfs[1]["value"] + dfs[2]["value"]).to_list()
+
+    # aggregate_series must return the same values
+    agg = r.aggregate_series("bulk", "sum", over=bulk_ids)
+    agg = agg.sort(["generation", "time"])
+    assert list(agg.columns) == ["generation", "time", "abs_time", "value"]
+    assert len(agg) == len(dfs[0])
+    assert agg["value"].to_list() == pytest.approx(expected_sum, rel=1e-5)
+
+
+# ============================================================================
 # Task 4: error types importable + column shape consistency
 # ============================================================================
 
