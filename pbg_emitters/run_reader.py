@@ -368,6 +368,48 @@ class RunReader:
             return self._xarray_series(observable)
         raise ValueError(f"Unknown kind: {self._kind!r}")
 
+    def summary(self) -> dict:
+        """Canonical quantitative summary of the run — the shape every recorded
+        simulation carries so tooling can render it uniformly.
+
+        Returns a dict with whatever could be read (best-effort; never raises)::
+
+            generations    : int  — number of generations in the run
+            n_observables   : int  — number of readouts collected
+            sim_minutes     : int  — simulated time (cumulative ``abs_time`` in
+                                     seconds / 60), NOT wall-clock
+
+        ``sim_minutes`` is derived from a scalar observable's ``abs_time``;
+        list/array-typed observables can't be cast to a numeric series, so we
+        try known scalars first and then fall back to scanning, guarding each
+        read so one bad observable never costs the generation/readout counts.
+        """
+        out: dict = {}
+        try:
+            gens = self.generations()
+            if gens:
+                out["generations"] = len(gens)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            obs = self.observables() or []
+        except Exception:  # noqa: BLE001
+            obs = []
+        if obs:
+            out["n_observables"] = len(obs)
+            for cand in ("listeners.mass.cell_mass", "listeners.mass.dry_mass",
+                         "listeners.mass.cellMass", "global_time", "time", *obs):
+                if cand not in obs:
+                    continue
+                try:
+                    df = self.series(cand)
+                except Exception:  # noqa: BLE001
+                    continue
+                if df is not None and len(df) and "abs_time" in df.columns:
+                    out["sim_minutes"] = int(round(float(df["abs_time"].max()) / 60.0))
+                    break
+        return out
+
     # ------------------------------------------------------------------
     # SQLite backend
     # ------------------------------------------------------------------
