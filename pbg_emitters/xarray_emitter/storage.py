@@ -304,13 +304,13 @@ class VariableSpec:
 
         Called by: :py:meth:`.alloc_time`.
         """
-        # avoid circular import at module level
-        from ecoli.processes.metabolism import TIME_UNITS
+        # TIME_UNITS was previously imported from ecoli.processes.metabolism;
+        # use "[s]" directly so pbg-emitters does not require vivarium-ecoli.
         assert isinstance(buf_size, int)
         return cls(
             partition=partition, var_name="",
             # type and units for real-valued time stamps
-            dtype=TIME_VAR_DTYPE.str, unit=TIME_UNITS.strUnit(),
+            dtype=TIME_VAR_DTYPE.str, unit="[s]",
             # integer-valued Xarray dimension coordinate
             coord=np.arange(buf_size, dtype=TIME_COO_DTYPE),
             is_time=True)

@@ -728,10 +728,36 @@ class RunReader:
 
         return xr.open_datatree(self._ref.store, engine="zarr")
 
+    def _xarray_time_ds(self, dt):
+        """Return the xarray Dataset that holds ``emitstep_gen=`` coordinates.
+
+        Hand-crafted fixtures (e.g. tests) put time coords at the root ``"/"``
+        node.  ``XArrayEmitter`` writes them at its partition path (e.g.
+        ``/experiment_id=X/variant=0/lineage_seed=0``).  This helper
+        searches root first, then all groups, so both layouts work.
+        """
+        from pbg_emitters.xarray_emitter.storage import TIME_COO_PREFIX
+
+        # Fast path: root node (hand-crafted test fixtures)
+        root_ds = dt["/"].ds
+        if any(c.startswith(TIME_COO_PREFIX) for c in root_ds.coords):
+            return root_ds
+
+        # Scan partition / child groups (real XArrayEmitter stores)
+        for path in dt.groups:
+            if path == "/":
+                continue
+            ds = dt[path].ds
+            if any(c.startswith(TIME_COO_PREFIX) for c in ds.coords):
+                return ds
+
+        return root_ds  # fallback — empty, gen_info will be []
+
     def _xarray_gen_info(self, dt) -> list[tuple[int, str, str]]:
         """Return list of (gen_int, time_coo_name, time_var_name) sorted by gen.
 
-        Reads from root node coords named ``emitstep_gen=N``.
+        Reads from whichever node holds ``emitstep_gen=N`` coordinates
+        (root for hand-crafted fixtures; partition path for XArrayEmitter).
         """
         # Import constants lazily — only executed on xarray backend
         from pbg_emitters.xarray_emitter.storage import (
@@ -739,9 +765,9 @@ class RunReader:
             TIME_VAR_PREFIX,
         )
 
-        root_ds = dt["/"].ds
+        time_ds = self._xarray_time_ds(dt)
         gen_info = []
-        for coo_name in root_ds.coords:
+        for coo_name in time_ds.coords:
             if coo_name.startswith(TIME_COO_PREFIX):
                 # e.g. "emitstep_gen=1" → extract "1" after last "="
                 gen = int(coo_name.rsplit("=", 1)[-1])
@@ -775,7 +801,7 @@ class RunReader:
             raise KeyError(observable)
 
         node_ds = dt[node_path].ds
-        root_ds = dt["/"].ds
+        time_ds = self._xarray_time_ds(dt)
         gen_info = self._xarray_gen_info(dt)
 
         rows = []
@@ -783,9 +809,9 @@ class RunReader:
             var_name = f"generation={gen}"
             if var_name not in node_ds.data_vars:
                 continue
-            if time_var not in root_ds.data_vars:
+            if time_var not in time_ds.data_vars:
                 continue
-            times = root_ds[time_var].values.ravel()
+            times = time_ds[time_var].values.ravel()
             values = node_ds[var_name].values.ravel()
             for t, v in zip(times, values):
                 rows.append({
