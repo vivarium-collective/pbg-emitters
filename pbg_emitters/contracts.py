@@ -47,3 +47,10 @@ try:
     register_contract("ParquetEmitter", ParquetEmitter.emitter_contract())
 except ImportError:
     pass
+
+try:
+    from .xarray_emitter import XArrayEmitter
+    register_contract("xarray", XArrayEmitter.emitter_contract())
+    register_contract("XArrayEmitter", XArrayEmitter.emitter_contract())
+except ImportError:
+    pass

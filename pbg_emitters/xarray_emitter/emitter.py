@@ -31,6 +31,8 @@ class XArrayEmitter(BufferedEmitter):
     config_schema = {
         **Emitter.config_schema,
         "out_uri":             {"_type": "string", "_default": ""},
+        "strategy":            {"_type": "string", "_default": "flat"},
+        "emit_root":           {"_type": "list", "_default": []},
         "transducer":          {"_type": "map", "_default": {}},
         "view":                {"_type": "list", "_default": []},
         "writer":              {"_type": "map", "_default": {}},
@@ -41,9 +43,18 @@ class XArrayEmitter(BufferedEmitter):
         "debug":               {"_type": "boolean", "_default": False},
     }
 
+    @classmethod
+    def emitter_contract(cls):
+        from pbg_emitters.contract import EmitterContract
+        return EmitterContract(output_kind="zarr", output_uri_config_key="out_uri")
+
     def __init__(self, config: dict[str, Any], core: Any) -> None:
         self.validate_config(config)
         self.debug: bool = bool(config.get("debug", False))
+        #: Partition strategy: "flat" (default, generic Step) or "colony"
+        #: (v2ecoli lineage layout). Selects how `extract_partition` reads
+        #: `agent_id`/`generation` from metadata.
+        self._strategy: str = config.get("strategy") or "flat"
         self._metadata_keys: list[str] = list(config.get("metadata_keys") or [])
         self._metadata_validators: dict[str, Any] = dict(
             config.get("metadata_validators") or {}
@@ -101,7 +112,8 @@ class XArrayEmitter(BufferedEmitter):
 
     def extract_partition(self, metadata: dict[str, Any]) -> XarrayStoragePartition:
         return XarrayStoragePartition.cast(
-            BufferedEmitter.extract_partition(self, metadata)
+            BufferedEmitter.extract_partition(
+                self, metadata, strategy=self._strategy)
         )
 
     def extract_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:

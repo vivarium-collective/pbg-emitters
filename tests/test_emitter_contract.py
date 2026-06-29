@@ -26,6 +26,18 @@ def test_parquet_emitter_self_describes():
     assert c.output_uri_config_key  # whatever real key it uses
 
 
+def test_xarray_emitter_self_describes():
+    pytest.importorskip("xarray")
+    pytest.importorskip("zarr")
+    from pbg_emitters.xarray_emitter import XArrayEmitter
+    c = XArrayEmitter.emitter_contract()
+    assert c.output_kind == "zarr"
+    assert c.output_uri_config_key == "out_uri"
+    assert contract_for("xarray").output_kind == "zarr"
+    assert contract_for("XArrayEmitter").output_kind == "zarr"
+    assert contract_for(XArrayEmitter).output_kind == "zarr"
+
+
 def test_contract_for_resolves_by_name_and_class():
     from pbg_emitters.sqlite_emitter import SQLiteEmitter
     assert contract_for("sqlite").output_kind == "sqlite"
