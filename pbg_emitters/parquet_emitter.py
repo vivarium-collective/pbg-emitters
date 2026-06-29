@@ -980,6 +980,11 @@ class ParquetEmitter(Emitter):
         "metadata":          {"_type": "map",          "_default": {}},
     }
 
+    @classmethod
+    def emitter_contract(cls):
+        from pbg_emitters.contract import EmitterContract
+        return EmitterContract(output_kind="parquet", output_uri_config_key="out_uri")
+
     def __init__(self, config: dict[str, Any], core: Any) -> None:
         super().__init__(config, core)
 
