@@ -361,6 +361,16 @@ class XarrayBuffer:
         self.root = self.root.isel(time_sel)
         for (path, var) in self.child_vars.items():
             self.child_vars[path] = var.isel(time_sel)
+        # Shrink the time coordinate too, so a subsequent static encoding (which
+        # asserts coo.shape == (buf_size,) and chunks on buf_size) stays
+        # consistent with the truncated buffer length. Without this, a final
+        # flush that also carries static (the first+final flush of a short
+        # generation, < buffer_size emits) asserts coo.shape (orig) !=
+        # (buf_size after truncate). VariableSpec is frozen, so rebuild it.
+        if self.time_spec is not None and self.time_spec.coord is not None:
+            import dataclasses as _dc
+            self.time_spec = _dc.replace(
+                self.time_spec, coord=self.time_spec.coord[:buf_tix])
 
     def clear(self) -> None:
         """
@@ -559,7 +569,12 @@ class XarrayTransducer:
         """
         self.check_buffer()
         if final:
-            assert not include_static
+            # include_static is valid on a final flush that is ALSO the first
+            # write of the partition (generation 1, num_writes == 0): a short
+            # generation whose only flush is the final one still needs its
+            # static coords/encodings written, else the partition is empty.
+            # truncate() shrinks buf_size AND the time coordinate to buf_tix, so
+            # the static encoding's coo.shape == (buf_size,) check stays valid.
             if self.buf_tix < self.buf_size:
                 # at least one unfilled emit step inside allocated buffer
                 self.truncate()
