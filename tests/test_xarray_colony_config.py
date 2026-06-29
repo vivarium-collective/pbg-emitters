@@ -85,6 +85,44 @@ def _drive_colony_generation(core, store, agent_id):
     return part
 
 
+@pytest.mark.parametrize("n_updates", [1, 2])
+def test_short_generation_final_flush_writes_data(tmp_path, n_updates):
+    """A generation with FEWER emits than the buffer size must still write its
+    partition.
+
+    With < buffer_size emits the only flush is the final one, which also carries
+    ``include_static`` (the first write of generation 1). Truncating the
+    partially filled buffer must shrink the time coordinate too, so the static
+    encoding's ``coo.shape == (buf_size,)`` check stays consistent. Before the
+    fix that final flush asserted, the runner swallowed it, and the store was
+    left an empty group skeleton (silent data loss).
+    """
+    from pbg_emitters.xarray_emitter import XArrayEmitter
+
+    core = allocate_core()
+    store = str(tmp_path / f"short_{n_updates}.zarr")
+    emitter = XArrayEmitter(_colony_config(store, "0"), core=core)  # generation 1
+    assert emitter.partition.generation == 1
+    for i in range(n_updates):  # n_updates < buffer size (3)
+        emitter.update({
+            "global_time": float(i),
+            "agents": {"0": {"listeners": {"mass": 10.0 + i}}},
+        })
+    emitter.close(success=True)  # must NOT raise and must finalize the store
+
+    tree = xr.open_datatree(store, engine="zarr", consolidated=False)
+    gen_vars = {
+        name: node[name]
+        for node in tree.subtree for name in node.data_vars
+        if "generation=1" in name
+    }
+    assert gen_vars, f"no generation=1 data written: " \
+        f"{[n for node in tree.subtree for n in node.data_vars]}"
+    # exactly n_updates time points were written (the truncated buffer length)
+    da = gen_vars["generation=1"]
+    assert da.sizes[next(iter(da.sizes))] == n_updates
+
+
 def test_xarray_colony_partition_uses_lineage_layout(tmp_path):
     core = allocate_core()
     store = str(tmp_path / "colony.zarr")
