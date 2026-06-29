@@ -53,6 +53,11 @@ class XarrayBuffer:
 
     #: Statically configured variable layout transformation.
     view: ForestView
+    #: Input sub-tree the transducer reads emitted data from. ``()`` (the
+    #: default) consumes the *flat wired state* a process-bigraph Step receives
+    #: in :py:meth:`!update`; the v2ecoli colony layout sets this to
+    #: ``("agents", <agent_id>)`` to strip the agent envelope.
+    emit_root: tuple[str, ...] = ()
     #: Dynamic metadata, received via :py:meth:`!Engine._emit_configuration`.
     partition: XarrayStoragePartition = field(init=False)
 
@@ -211,13 +216,20 @@ class XarrayBuffer:
         # write time stamp to buffer
         self.root[self.time_var][t_ix] = t
 
-        # strip agent prefix and remove schema paths with empty emit values
-        agent_path = ("agents", self.partition.agent_id)
-        emit_data = dict_to_paths((), get_in(data, agent_path))
+        # read emitted data from the configured input sub-tree. With the
+        # default ``emit_root == ()`` this is the flat wired Step state; the
+        # colony layout sets ``emit_root = ("agents", <agent_id>)`` to strip
+        # the agent envelope. Schema paths with empty emit values are removed.
+        emit_data = dict_to_paths((), get_in(data, self.emit_root))
 
         # check for expected emit paths
         emit_queue = set(self.view.emitted_paths)
         for (v_path, val) in emit_data:
+            # the time stamp is consumed separately (see `XarrayTransducer.step`)
+            # and is never an emitted variable; skip it in flat mode where it
+            # appears as a sibling of the emitted ports.
+            if v_path in (("global_time",), ("time",)):
+                continue
             # find output schema location
             match self.output_paths.get(v_path):
                 case None:
@@ -408,7 +420,8 @@ class XarrayTransducer:
         """ Criterion for which *simulation steps* also become *emit steps*. """
 
         view = ForestView.from_dict(config["view"])
-        self.buffer: XarrayBuffer = XarrayBuffer(view)
+        emit_root = tuple(config.get("emit_root") or ())
+        self.buffer: XarrayBuffer = XarrayBuffer(view, emit_root)
         """ In-memory cyclic buffer for simulation data. """
 
         self.buf_size: int = _config["buffer"]["size"]
@@ -500,7 +513,13 @@ class XarrayTransducer:
           `False` if the buffer is full and the operation cannot be performed
           without first :py:meth:`.flush`\ ing, otherwise `True`.
         """
-        if self.predicate(self.sim_tix, t := get_in(data, ("time",)), data):
+        # As a process-bigraph Step, time arrives via the wired ``global_time``
+        # port; fall back to the legacy top-level ``("time",)`` key for the
+        # v2ecoli colony shape that predates Step injection.
+        t = get_in(data, ("global_time",))
+        if t is None:
+            t = get_in(data, ("time",))
+        if self.predicate(self.sim_tix, t, data):
             if self.buf_tix < self.buf_size:
                 # fill current emit step
                 self.buffer.write(self.buf_tix, self.sim_tix, t, data)

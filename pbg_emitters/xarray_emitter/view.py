@@ -381,3 +381,51 @@ class ForestView:
         """
         return dict(chain.from_iterable(
             zip(t.emitted_paths, t.leaves) for t in self.forest))
+
+
+# ==============================================================================
+
+
+def view_from_emit_paths(
+    ports: list[str],
+    *,
+    dtype: str = "<f8",
+    unit: str | None = None,
+    coords: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build a :py:class:`.ForestView` config from flat emit-port names.
+
+    When :py:class:`.XArrayEmitter` is injected as a generic process-bigraph
+    Step, the wired state it receives is keyed by the emit-port names produced
+    by :py:func:`process_bigraph.emitter.collect_input_ports` — slash-joined
+    store paths such as ``"counter_store/value"``. Each such port maps onto a
+    single-element input :py:data:`~.HierarchyPath` (the literal port string),
+    which the transducer matches when ``emit_root == ()``.
+
+    The output (Xarray) location is derived by splitting the port on ``"/"``
+    (``NodePath`` semantics), so ``"counter_store/value"`` lands at the
+    DataTree node ``/counter_store/value``.
+
+    Args:
+      ports:  Emit-port names (e.g. from ``collect_input_ports``), already
+              stripped of the ``"global_time"`` port.
+      dtype:  Numpy dtype string for every leaf variable.
+      unit:   Optional ``"[...]"`` unit annotation applied to every leaf.
+      coords: Optional mapping ``port -> coordinate-array`` for *vector*
+              variables. A port present here becomes a 1-D-per-tick variable
+              with the given coordinate; ports absent from it stay scalar.
+
+    Returns:
+      A ``view`` config (list with a single :py:class:`.TreeView` dict)
+      suitable for :py:meth:`.ForestView.from_dict`.
+    """
+    if not ports:
+        raise ValueError("view_from_emit_paths: no emit ports supplied")
+    metadata = bool(coords)
+    variables: dict[str, Any] = {}
+    for port in ports:
+        leaf: dict[str, Any] = {"path": port, "dtype": dtype}
+        if unit is not None:
+            leaf["unit"] = unit
+        variables[port] = [leaf]
+    return [{"root": (), "metadata": metadata, "variables": variables}]

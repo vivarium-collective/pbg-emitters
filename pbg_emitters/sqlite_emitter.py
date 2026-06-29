@@ -300,6 +300,11 @@ class SQLiteEmitter(Emitter):
         'batch_size': {'_type': 'integer', '_default': 1},
     }
 
+    @classmethod
+    def emitter_contract(cls):
+        from pbg_emitters.contract import EmitterContract
+        return EmitterContract(output_kind="sqlite", output_uri_config_key="db_file")
+
     def __init__(self, config, core):
         super().__init__(config, core)
         self.simulation_id = config.get('simulation_id') or str(uuid.uuid4())

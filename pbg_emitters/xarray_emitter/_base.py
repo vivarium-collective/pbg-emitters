@@ -60,7 +60,10 @@ class StoragePartition:
     variant: int
     lineage_seed: int
     generation: int = field(init=False)
-    agent_id: str
+    #: Cell-lineage id. Only meaningful under the ``"colony"`` partition
+    #: strategy; under the default ``"flat"`` strategy it is the degenerate
+    #: ``"1"`` (``generation == 1``, no lineage), so callers need not supply it.
+    agent_id: str = "1"
 
     def __post_init__(self) -> None:
         assert isinstance(self.experiment_id, str)
@@ -104,17 +107,36 @@ class BufferedEmitter(Emitter, ABC):
         Flag set by :py:meth:`.finalize` after writing the last buffer.
         """
 
-    def extract_partition(self, metadata: dict[str, Any], /) -> StoragePartition:
+    def extract_partition(
+        self, metadata: dict[str, Any], /, *, strategy: str = "flat"
+    ) -> StoragePartition:
         """
         Define the current :py:class:`StoragePartition` from the simulation
         metadata received via :py:meth:`!Engine._emit_configuration`.
+
+        Args:
+          strategy: ``"flat"`` (default) produces a single degenerate partition
+                    with ``generation == 1`` and no lineage semantics —
+                    ``agent_id`` in ``metadata`` is ignored. ``"colony"``
+                    restores the v2ecoli lineage layout, reading ``agent_id``
+                    from ``metadata`` (``generation == len(agent_id)``, with a
+                    ``parent`` cell).
         """
+        if strategy == "colony":
+            agent_id = metadata.get("agent_id", "1")
+        elif strategy == "flat":
+            # degenerate single partition; lineage semantics are not used
+            agent_id = "1"
+        else:
+            raise ValueError(
+                f"unknown partition strategy {strategy!r}; "
+                f"expected 'flat' or 'colony'")
         return StoragePartition(
             experiment_id=parse.quote_plus(
                 metadata.get("experiment_id", "default")),
             variant=int(metadata.get("variant", 0)),
             lineage_seed=int(metadata.get("lineage_seed", 0)),
-            agent_id=metadata.get("agent_id", "1"))
+            agent_id=agent_id)
 
     def finalize(self, *, success: bool = False) -> None:
         """
