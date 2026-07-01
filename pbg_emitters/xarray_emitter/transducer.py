@@ -10,10 +10,12 @@ upstream (:py:class:`~vivarium.core.engine.Engine`) or downstream
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, replace as dc_replace
 from functools import cached_property
 from typing import Any, cast, TYPE_CHECKING
 
+import numpy as np
 import xarray
 from xarray import Dataset, DataTree
 from xarray.core.datatree import NodePath
@@ -83,6 +85,17 @@ class XarrayBuffer:
     #:
     #: .. _Xarray data variables: https://docs.xarray.dev/en/stable/user-guide/terminology.html#term-Variable
     child_vars: dict[NodePath, Dataset] = field(default_factory=dict)
+
+    #: Input (Vivarium store) paths that have been *dropped* on the generic
+    #: emit-all path because their value is not representable in a fixed-shape
+    #: store (>1-D, or a 1-D length that changed across ticks). Once dropped, a
+    #: port is skipped on subsequent ticks, excluded from the "Missing emit
+    #: paths" check, and excluded from :py:meth:`.render`.
+    dropped_paths: set[HierarchyPath] = field(default_factory=set)
+    #: Output (Xarray node) paths lazily *promoted* from scalar to a 1-D vector
+    #: variable, mapped to the promoted coordinate length. Used to detect a
+    #: subsequent length change (which triggers a drop).
+    promoted_lengths: dict[NodePath, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         assert isinstance(self.view, ForestView)
@@ -222,13 +235,16 @@ class XarrayBuffer:
         # the agent envelope. Schema paths with empty emit values are removed.
         emit_data = dict_to_paths((), get_in(data, self.emit_root))
 
-        # check for expected emit paths
-        emit_queue = set(self.view.emitted_paths)
+        # check for expected emit paths (dropped ports are no longer required)
+        emit_queue = set(self.view.emitted_paths) - self.dropped_paths
         for (v_path, val) in emit_data:
             # the time stamp is consumed separately (see `XarrayTransducer.step`)
             # and is never an emitted variable; skip it in flat mode where it
             # appears as a sibling of the emitted ports.
             if v_path in (("global_time",), ("time",)):
+                continue
+            # a port dropped on an earlier tick is silently ignored
+            if v_path in self.dropped_paths:
                 continue
             # find output schema location
             match self.output_paths.get(v_path):
@@ -242,11 +258,104 @@ class XarrayBuffer:
                         continue
                     raise KeyError(f"Unexpected emit path: {v_path}")
                 case (x_node, x_var):
-                    # write to output schema location inside buffer
-                    self.child_vars[x_node][x_var][t_ix] = val
+                    spec = self.var_specs.get(x_node)
+                    if spec is not None and spec.coord is None:
+                        # generic emit-all path: this port was allocated as a
+                        # scalar (no caller-supplied coord). Lazily promote a
+                        # 1-D vector, or drop a non-representable value, rather
+                        # than crash on the shape mismatch.
+                        self._write_dynamic(x_node, x_var, v_path, t_ix, val)
+                    else:
+                        # caller-supplied coord (or time) — write directly; this
+                        # path is unchanged.
+                        self.child_vars[x_node][x_var][t_ix] = val
                     emit_queue.discard(v_path)
         if len(emit_queue) and sim_tix > 0:
             raise KeyError(f"Missing emit paths: {list(emit_queue)}")
+
+    # ~~~~~~~~~~~~~~~~~ #
+
+    def _write_dynamic(
+        self, x_node: NodePath, x_var: str,
+        v_path: HierarchyPath, t_ix: dict[str, int], val: Any, /
+    ) -> None:
+        """
+        Write a value into a *scalar-allocated* (``coord is None``) output
+        variable on the generic emit-all path, promoting or dropping as needed.
+
+        - ``ndim == 0`` (genuine scalar): write exactly as before.
+        - ``ndim == 1``: lazily :py:meth:`._promote_port` the variable to a
+          coord-bearing ``(buf_size, N)`` vector on first sight, then write;
+          on a later length change, :py:meth:`._drop_port`.
+        - ``ndim >= 2``: :py:meth:`._drop_port`.
+
+        Called by: :py:meth:`.write`.
+        """
+        arr = np.asarray(val)
+        promoted = self.promoted_lengths.get(x_node)
+        if promoted is not None:
+            # already a vector variable: require a matching 1-D length
+            if arr.ndim == 1 and arr.shape[0] == promoted:
+                self.child_vars[x_node][x_var][t_ix] = arr
+            else:
+                self._drop_port(x_node, v_path, arr.shape)
+            return
+        if arr.ndim == 0:
+            # genuine scalar — behaves exactly as the pre-fix code path
+            self.child_vars[x_node][x_var][t_ix] = val
+        elif arr.ndim == 1:
+            self._promote_port(x_node, arr.shape[0])
+            self.child_vars[x_node][x_var][t_ix] = arr
+        else:
+            self._drop_port(x_node, v_path, arr.shape)
+
+    def _promote_port(self, x_node: NodePath, length: int, /) -> None:
+        """
+        Reallocate a scalar-allocated output variable as a coord-bearing 1-D
+        vector variable of coordinate length ``length``, using a synthetic
+        ``np.arange(length)`` coordinate. The resulting :py:class:`.VariableSpec`
+        is indistinguishable from a caller-supplied-coord spec, so
+        :py:meth:`.render` / :py:meth:`.VariableSpec.encoding` and the zarr path
+        serialize it exactly as the metadata path would.
+
+        Called by: :py:meth:`._write_dynamic`.
+        """
+        spec = self.var_specs[x_node]
+        # recover the allocated time-dimension length from the existing scalar
+        # buffer (equals the transducer's ``buf_size``)
+        buf_size = int(self.child_vars[x_node].sizes[self.time_coo])
+        new_spec = dc_replace(spec, coord=np.arange(length))
+        self.var_specs[x_node] = new_spec
+        self.child_coords[x_node] = new_spec.alloc_coord()
+        self.child_vars[x_node] = new_spec.alloc_var(buf_size)
+        self.promoted_lengths[x_node] = length
+
+    def _drop_port(
+        self, x_node: NodePath, v_path: HierarchyPath, shape: tuple[int, ...], /
+    ) -> None:
+        """
+        Permanently exclude an output variable whose value is not representable
+        in a fixed-shape store. Warns once, then removes the port from every
+        buffer structure so subsequent ticks skip it, the "Missing emit paths"
+        check ignores it, and :py:meth:`.render` excludes it.
+
+        Called by: :py:meth:`._write_dynamic`.
+        """
+        if v_path not in self.dropped_paths:
+            warnings.warn(
+                f"XArray emitter: dropping port "
+                f"{'/'.join(str(p) for p in v_path)} — value shape "
+                f"{tuple(shape)} is not representable in a fixed-shape store "
+                f"(must be scalar or a stable 1-D vector).",
+                stacklevel=3)
+        self.dropped_paths.add(v_path)
+        self.var_specs.pop(x_node, None)
+        self.child_vars.pop(x_node, None)
+        self.child_coords.pop(x_node, None)
+        self.promoted_lengths.pop(x_node, None)
+        # `added_paths` is derived from `child_vars`; force a recompute so a
+        # later `render()` does not assert on the now-removed group.
+        self.__dict__.pop("added_paths", None)
 
     def render(
         self, writer: AsyncBufferWriter | None, buf_size: int,
@@ -379,6 +488,8 @@ class XarrayBuffer:
         self.root = Dataset()
         self.child_coords = {}
         self.child_vars = {}
+        self.dropped_paths = set()
+        self.promoted_lengths = {}
 
 
 # ==============================================================================
