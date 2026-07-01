@@ -96,6 +96,9 @@ class XarrayBuffer:
     #: variable, mapped to the promoted coordinate length. Used to detect a
     #: subsequent length change (which triggers a drop).
     promoted_lengths: dict[NodePath, int] = field(default_factory=dict)
+    #: Ports for which the lossy late-promotion warning has already been emitted
+    #: (warn-once guard, mirrors the ``dropped_paths`` pattern).
+    late_promoted_paths: set[NodePath] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         assert isinstance(self.view, ForestView)
@@ -264,7 +267,7 @@ class XarrayBuffer:
                         # scalar (no caller-supplied coord). Lazily promote a
                         # 1-D vector, or drop a non-representable value, rather
                         # than crash on the shape mismatch.
-                        self._write_dynamic(x_node, x_var, v_path, t_ix, val)
+                        self._write_dynamic(x_node, x_var, v_path, t_ix, val, buf_tix)
                     else:
                         # caller-supplied coord (or time) — write directly; this
                         # path is unchanged.
@@ -277,7 +280,8 @@ class XarrayBuffer:
 
     def _write_dynamic(
         self, x_node: NodePath, x_var: str,
-        v_path: HierarchyPath, t_ix: dict[str, int], val: Any, /
+        v_path: HierarchyPath, t_ix: dict[str, int], val: Any,
+        buf_tix: int, /
     ) -> None:
         """
         Write a value into a *scalar-allocated* (``coord is None``) output
@@ -304,12 +308,15 @@ class XarrayBuffer:
             # genuine scalar — behaves exactly as the pre-fix code path
             self.child_vars[x_node][x_var][t_ix] = val
         elif arr.ndim == 1:
-            self._promote_port(x_node, arr.shape[0])
+            self._promote_port(x_node, arr.shape[0], v_path, buf_tix)
             self.child_vars[x_node][x_var][t_ix] = arr
         else:
             self._drop_port(x_node, v_path, arr.shape)
 
-    def _promote_port(self, x_node: NodePath, length: int, /) -> None:
+    def _promote_port(
+        self, x_node: NodePath, length: int,
+        v_path: HierarchyPath, buf_tix: int, /
+    ) -> None:
         """
         Reallocate a scalar-allocated output variable as a coord-bearing 1-D
         vector variable of coordinate length ``length``, using a synthetic
@@ -318,8 +325,24 @@ class XarrayBuffer:
         :py:meth:`.render` / :py:meth:`.VariableSpec.encoding` and the zarr path
         serialize it exactly as the metadata path would.
 
+        If ``buf_tix > 0`` the port has already written scalar values into the
+        current buffer that are now silently discarded (the reallocated Dataset
+        is zero-filled).  A one-time warning is emitted in that case so the
+        lossy promotion is audible.  The promotion behaviour itself is unchanged.
+
         Called by: :py:meth:`._write_dynamic`.
         """
+        if buf_tix > 0 and x_node not in self.late_promoted_paths:
+            port_str = "/".join(str(p) for p in v_path)
+            warnings.warn(
+                f"XArray emitter: port {port_str} emitted scalars before "
+                f"becoming a length-{length} vector at tick {buf_tix}; "
+                f"earlier samples in this buffer are discarded (promotion is "
+                f"only lossless when the vector shape is present from the "
+                f"first emit).",
+                stacklevel=4,
+            )
+            self.late_promoted_paths.add(x_node)
         spec = self.var_specs[x_node]
         # recover the allocated time-dimension length from the existing scalar
         # buffer (equals the transducer's ``buf_size``)
@@ -490,6 +513,7 @@ class XarrayBuffer:
         self.child_vars = {}
         self.dropped_paths = set()
         self.promoted_lengths = {}
+        self.late_promoted_paths = set()
 
 
 # ==============================================================================

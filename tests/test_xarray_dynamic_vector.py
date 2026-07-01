@@ -84,6 +84,8 @@ class MatrixProcess(Process):
         return {"m": np.zeros((2, 2))}
 
 
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -356,3 +358,48 @@ def test_caller_coord_vector_still_works(tmp_path):
         rows = rows.T
     for k in range(rows.shape[0]):
         np.testing.assert_allclose(rows[k], k * np.array([1.0, 2.0, 3.0]))
+
+
+def test_late_scalar_to_vector_promotion_warns():
+    """Case 4: XarrayBuffer warns when scalar→vector promotion occurs at buf_tix > 0.
+
+    Tests the ``_promote_port`` warning path directly, without going through
+    the full composite / bigraph schema machinery.  The scenario:
+
+    - ``write(buf_tix=0, …, scalar)``   — port allocated as scalar; no promotion
+    - ``write(buf_tix=1, …, 1-D array)`` — first sight of a vector, buf_tix > 0
+      → lossy promotion (earlier scalar sample silently zeroed) → must warn once.
+
+    Assertions:
+    (a) the second write does not raise,
+    (b) a warning is raised whose text names the port (``lv_store/v``) and
+        mentions discarded / earlier samples.
+    """
+    from pbg_emitters.xarray_emitter.transducer import XarrayBuffer
+    from pbg_emitters.xarray_emitter.view import ForestView, view_from_emit_paths
+    from pbg_emitters.xarray_emitter.storage import XarrayStoragePartition
+    from pbg_emitters.xarray_emitter._base import StoragePartition
+
+    emit_ports = ["lv_store/v"]
+    view_config = view_from_emit_paths(emit_ports, dtype="<f8")
+    forest_view = ForestView.from_dict(view_config)
+
+    base_part = StoragePartition(experiment_id="test", variant=0, lineage_seed=0)
+    xpart = XarrayStoragePartition.cast(base_part)
+
+    buf = XarrayBuffer(view=forest_view, emit_root=())
+    buf.assemble(xpart, {})
+    buf.alloc(4, {})
+
+    # tick 0: scalar → allocated as scalar; no promotion (buf_tix == 0)
+    buf.write(0, 0, 0.0, {"lv_store/v": np.float64(7.0)})
+
+    # tick 1: 1-D vector → late promotion (buf_tix == 1 > 0) → must warn
+    with pytest.warns(UserWarning, match=r"lv_store/v") as warning_list:
+        buf.write(1, 1, 1.0, {"lv_store/v": np.array([1.0, 2.0, 3.0])})
+
+    # (a) no crash; (b) warning text mentions discarded / earlier samples
+    msgs = [str(w.message) for w in warning_list]
+    assert any(
+        "discarded" in m or "earlier" in m for m in msgs
+    ), f"expected 'discarded'/'earlier' in warning text, got: {msgs}"
