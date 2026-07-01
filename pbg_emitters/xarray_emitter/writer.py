@@ -233,6 +233,21 @@ class AsyncBufferWriter[StoreT](ABC):
     # ~~~~~~~~~~~~~~~~~ #
 
     @property
+    def out_uri(self) -> str:
+        """
+        URI of the backing store, as a string.
+
+        This property is required by the dashboard's ``_flush_step_emitters``
+        helper, which gates the ``close(success=True)`` call on
+        ``hasattr(writer, "out_uri")``.  Without it the zarr store is never
+        consolidated and the dashboard falls back to sqlite.
+
+        ``config["store"]`` is guaranteed to exist — enforced by
+        :py:meth:`.validate_config`.
+        """
+        return str(self.config["store"])
+
+    @property
     def buffer(self) -> XarrayBuffer:
         """
         Dynamic configuration, received via :py:meth:`!Engine._emit_configuration`.
