@@ -67,8 +67,11 @@ except ImportError:
 
 try:
     from pbg_emitters.xarray_emitter import XArrayEmitter  # noqa: F401
-except ImportError:
-    pass  # [xarray] extra not installed
+except (ImportError, SyntaxError):
+    # ImportError: [xarray] extra not installed.
+    # SyntaxError: the backend uses 3.12+ syntax and this is an older interpreter
+    # (also gated explicitly in xarray_emitter/__init__ — belt and suspenders).
+    pass
 
 try:
     from pbg_emitters.run_reader import (  # noqa: F401
