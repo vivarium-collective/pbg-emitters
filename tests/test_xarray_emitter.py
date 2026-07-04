@@ -79,3 +79,44 @@ def test_empty_metadata_validators_no_op(minimal_xarray_config, core):
     emitter = XArrayEmitter(config=cfg, core=core)
     assert emitter is not None
     emitter.close()  # tidy up the writer
+
+
+# ---------------------------------------------------------------------------
+# out_uri property — required by the dashboard's _flush_step_emitters gate
+# ---------------------------------------------------------------------------
+
+def test_async_zarr_buffer_writer_has_out_uri(tmp_path):
+    """AsyncBufferWriter.out_uri must return str(config['store']).
+
+    Without this property, the dashboard's _flush_step_emitters helper
+    returns False from _buffers(inst) and skips close()/consolidate(),
+    leaving the zarr store unconsolidated → sqlite fallback.
+    """
+    from pbg_emitters.xarray_emitter.writer import AsyncBufferWriter
+
+    store = str(tmp_path / "test_writer.zarr")
+    config = {
+        "backend": "zarr",
+        "store": store,
+        "buffers_per_chunk": 1,
+        "backend_config": {"format": 3},
+    }
+    writer = AsyncBufferWriter.dispatch(config)
+    assert hasattr(writer, "out_uri"), "writer.out_uri attribute must exist"
+    assert writer.out_uri == store
+
+
+def test_xarray_emitter_writer_out_uri_accessible(minimal_xarray_config, core):
+    """XArrayEmitter.writer.out_uri is reachable without AttributeError.
+
+    The dashboard checks hasattr(inst.writer, 'out_uri') — this test
+    confirms the emitter's writer exposes out_uri after construction.
+    Also covers emitter.py:200 (self.writer.out_uri in query()).
+    """
+    from pbg_emitters.xarray_emitter import XArrayEmitter
+
+    emitter = XArrayEmitter(config=minimal_xarray_config, core=core)
+    # must not raise AttributeError
+    uri = emitter.writer.out_uri
+    assert uri == minimal_xarray_config["writer"]["store"]
+    emitter.close()
