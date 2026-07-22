@@ -17,6 +17,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import warnings
 from concurrent.futures import Future, ThreadPoolExecutor, Executor
 from typing import Any, Callable, Mapping, Optional, cast
 from urllib import parse
@@ -1040,6 +1041,10 @@ class ParquetEmitter(Emitter):
         self.pl_types: dict[str, pl.DataType | DataTypeClass] = {}
         self.np_types: dict[str, Any] = {}
         self.pl_serialized: set[str] = set()
+        # Columns whose inner type varies irreconcilably across ticks (scalar at
+        # one tick, length-N array at another). Dropped on first failure and
+        # skipped thereafter so one ragged listener can't sink the whole run.
+        self._dropped_cols: set[str] = set()
         # column name -> unit string, captured when a quantity[...] port emits
         # a pint.Quantity; written as Parquet file metadata so the unit travels
         # with the data without renaming the (magnitude-valued) column.
@@ -1156,6 +1161,8 @@ class ParquetEmitter(Emitter):
         emit_idx = self.num_emits % self.batch_size
 
         for k, v in flat.items():
+            if k in self._dropped_cols:
+                continue
             if k not in self.pl_serialized:
                 try:
                     if k not in self.np_types:
@@ -1207,9 +1214,18 @@ class ParquetEmitter(Emitter):
             curr_type = self.pl_types.setdefault(k, pl.Null)
             if ser.dtype != curr_type:
                 force_inner = _polars_dtype_from_override(k, overrides)
-                self.pl_types[k] = union_pl_dtypes(
-                    curr_type, ser.dtype, k, force_inner
-                )
+                try:
+                    self.pl_types[k] = union_pl_dtypes(
+                        curr_type, ser.dtype, k, force_inner
+                    )
+                except TypeError:
+                    # Inner type varies irreconcilably across ticks (e.g. a
+                    # listener that is a scalar at t=0 then a length-N array
+                    # later): it can't live in one parquet column. Drop it
+                    # rather than sinking the whole run — mirrors
+                    # json_to_parquet's drop-on-fail at flush.
+                    self._drop_column(k)
+                    continue
             if k not in self.buffered_emits:
                 self.buffered_emits[k] = [None] * self.batch_size
             self.buffered_emits[k][emit_idx] = ser[0]
@@ -1239,6 +1255,24 @@ class ParquetEmitter(Emitter):
             if self.threaded:
                 self.buffered_emits = {}
         return {}
+
+    def _drop_column(self, k: str) -> None:
+        """Permanently drop a column that can't be stored (irreconcilable inner
+        types across ticks). Removes any buffered/typed state and records the
+        name so later ticks skip it. Logged once for diagnosability."""
+        if k in self._dropped_cols:
+            return
+        self._dropped_cols.add(k)
+        self.buffered_emits.pop(k, None)
+        self.pl_types.pop(k, None)
+        self.np_types.pop(k, None)
+        self.pl_serialized.discard(k)
+        self.column_units.pop(k, None)
+        warnings.warn(
+            f"ParquetEmitter: dropping column {k!r} — its value type varies "
+            f"across ticks and cannot be stored in a single parquet column.",
+            stacklevel=2,
+        )
 
     def _flush_partial_batch(self) -> None:
         """Write the trailing partial batch (rows after the last batch_size flush).

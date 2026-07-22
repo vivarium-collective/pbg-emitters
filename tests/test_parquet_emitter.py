@@ -511,6 +511,43 @@ class TestParquetEmitterIntegration:
         assert df_sorted["value"].to_list() == [10, 20, 30]
         assert df_sorted["ratio"].to_list() == [0.5, 0.75, 1.0]
 
+    def test_drop_shape_varying_column_does_not_crash(self, temp_dir, core):
+        """A column that is a scalar at one tick and a length-N array at another
+        cannot live in a single parquet column. The emitter DROPS it (with a
+        warning) and finishes the run, instead of raising and sinking the whole
+        simulation. The other columns persist.
+
+        Regression: a full emit of baseline listeners hit
+        ``listeners__rnap_data__rna_init_event_per_cistron`` (Int64 at t=0, then
+        Array(Int64, 4538) later); ``union_pl_dtypes`` raised TypeError mid-run.
+        """
+        import numpy as np
+
+        emitter = ParquetEmitter(
+            config={
+                "out_dir": temp_dir,
+                "batch_size": 8,  # keep both ticks in one batch
+                "threaded": False,
+                "metadata": {"experiment_id": "ragged"},
+            },
+            core=core,
+        )
+        emitter.last_batch_future.result()
+
+        with pytest.warns(UserWarning, match="dropping column"):
+            emitter.update({"time": 1.0, "keep": 10, "ragged": 5})
+            emitter.update({"time": 2.0, "keep": 20,
+                            "ragged": np.array([1, 2, 3, 4])})
+        emitter.close(success=False)
+
+        assert "ragged" in emitter._dropped_cols
+        df = emitter.query()
+        assert "ragged" not in df.columns
+        assert sorted(df.columns) == ["keep", "time"]
+        df_sorted = df.sort("time")
+        assert df_sorted["time"].to_list() == [1.0, 2.0]
+        assert df_sorted["keep"].to_list() == [10, 20]
+
     def test_round_trip_quantity_unit_bearing_port(self, temp_dir, core):
         """A pint.Quantity (a ``quantity[...]`` port value) is stripped to its
         magnitude under the SAME column name, and the unit is recorded as
