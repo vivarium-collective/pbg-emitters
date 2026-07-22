@@ -99,7 +99,33 @@ def json_to_parquet(
         metadata: Optional file-level Parquet key/value metadata (e.g. the
             unit string for each unit-bearing column).
     """
-    tbl = pl.DataFrame(emit_dict, schema={k: schema[k] for k in emit_dict})
+    col_schema = {k: schema[k] for k in emit_dict}
+    try:
+        tbl = pl.DataFrame(emit_dict, schema=col_schema)
+    except (TypeError, ValueError, pl.exceptions.PolarsError) as exc:
+        # Some column's buffered rows can't be built into one Series — almost
+        # always a field whose SHAPE varies across ticks (scalar on some ticks,
+        # a vector on others), which is unstorable in a single rectangular
+        # Parquet column. Crashing here loses the ENTIRE batch, so every
+        # downstream viz/analysis then sees "no run data". Build column-by-column
+        # instead and DROP only the genuinely unstorable column(s), preserving
+        # every well-behaved observable so the batch is written and the viz has
+        # data. (Unit metadata is file-level, so it is unaffected.)
+        cols: list[pl.Series] = []
+        dropped: list[str] = []
+        for k, v in emit_dict.items():
+            try:
+                cols.append(pl.Series(k, v))
+            except (TypeError, ValueError, pl.exceptions.PolarsError):
+                dropped.append(k)
+        tbl = pl.DataFrame(cols)
+        print(
+            f"parquet: dropped {len(dropped)} column(s) with an unstorable "
+            f"time-varying shape so the batch could be written: {dropped[:8]}"
+            + (" …" if len(dropped) > 8 else "")
+            + f" [{type(exc).__name__}: {exc}]",
+            flush=True,
+        )
     # GCS should have atomic uploads, but on a local filesystem, DuckDB may fail
     # trying to read partially written Parquet files. Get around this by writing
     # to a temporary file and then renaming it to the final output file.
