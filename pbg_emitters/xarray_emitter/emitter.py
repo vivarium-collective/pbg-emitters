@@ -40,6 +40,7 @@ class XArrayEmitter(BufferedEmitter):
         "metadata_keys":       {"_type": "list[string]", "_default": []},
         "metadata_validators": {"_type": "map", "_default": {}},
         "output_metadata":     {"_type": "map", "_default": {}},
+        "provenance":          {"_type": "map", "_default": {}},
         "debug":               {"_type": "boolean", "_default": False},
     }
 
@@ -59,6 +60,11 @@ class XArrayEmitter(BufferedEmitter):
         self._metadata_validators: dict[str, Any] = dict(
             config.get("metadata_validators") or {}
         )
+        #: Immutable run provenance (which composite + config produced this
+        #: output) written verbatim to the zarr store's ROOT attributes under
+        #: the "provenance" key, so a saved simulation is self-describing.
+        #: Treated as an opaque JSON-serializable map — empty => no attr.
+        self._provenance: dict[str, Any] = dict(config.get("provenance") or {})
         self._closed: bool = False
 
         # Unconditionally build the transducer and writer. Tests that only
@@ -66,6 +72,9 @@ class XArrayEmitter(BufferedEmitter):
         # config (see the `minimal_xarray_config` fixture in tests/conftest.py).
         self.transducer = XarrayTransducer(config, debug=self.debug)
         self.writer = AsyncBufferWriter.dispatch(config["writer"])
+        # Provenance is written to the store's ROOT attrs at finalize time,
+        # by the writer, so it survives the async buffer + consolidation.
+        self.writer.provenance = self._provenance
 
         # Call the BufferedEmitter base __init__ AFTER setting up attributes
         # (per the upstream warning that __init__ must be called at the end).

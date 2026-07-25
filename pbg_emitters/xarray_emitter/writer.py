@@ -194,6 +194,12 @@ class AsyncBufferWriter[StoreT](ABC):
         self.future.set_result(None)
         self.num_writes: int = 0
         """ Count of submitted buffer writes. """
+        self.provenance: dict[str, Any] = {}
+        """
+        Immutable run provenance to persist verbatim under the ROOT group's
+        ``"provenance"`` attribute at :py:meth:`.close`. Set by the emitter;
+        an empty map means no attribute is written.
+        """
 
     @classmethod
     def validate_config(cls, config: dict[str, Any], /) -> None:
@@ -326,6 +332,12 @@ class AsyncBufferWriter[StoreT](ABC):
         if self.num_writes > 0:
             self.sync(shutdown=True)
         self.executor.shutdown(wait=True)
+        # Persist run provenance to the ROOT group's attributes BEFORE
+        # consolidation, so the fixed-contract attr is captured in the store's
+        # consolidated metadata and a fresh reader sees it. Same lifecycle
+        # point (pre-consolidate, post-sync) as the success/log root attrs.
+        if self.provenance:
+            self.update_attributes(NodePath(), {"provenance": dict(self.provenance)})
         self.consolidate()
         assert self._store_finalizer is not None
         self._store_finalizer()
