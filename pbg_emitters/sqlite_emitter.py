@@ -41,6 +41,18 @@ def _json_default(value):
         return int(value)
     if isinstance(value, (np.floating,)):
         return float(value)
+    # pint.Quantity wired to a quantity[...] port: persist the bare magnitude
+    # (mirrors ParquetEmitter._strip_units / _is_quantity) so history stays
+    # numeric instead of a "<Quantity(...)>" repr string that the viewer would
+    # render character-by-character. Duck-typed to avoid importing pint; the
+    # returned magnitude may be an np scalar/array, which json re-serializes
+    # through this same default (np.floating -> float, ndarray -> tolist()).
+    if (
+        hasattr(value, "magnitude")
+        and hasattr(value, "units")
+        and hasattr(value, "dimensionality")
+    ):
+        return value.magnitude
     # bigraph-schema Node dataclasses (String, Float, Integer, ...) can end
     # up wired into emitted state; fall back to their repr so history stays
     # serializable without dragging in the schema machinery.

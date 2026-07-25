@@ -19,7 +19,25 @@ from pbg_emitters.sqlite_emitter import (
     list_simulations,
     load_history,
     load_simulation_metadata,
+    _json_default,
 )
+
+
+class _FakeQuantity:
+    """Duck-typed pint.Quantity: exposes magnitude/units/dimensionality.
+
+    _json_default keys off these three attributes (mirroring
+    ParquetEmitter._is_quantity), so this stands in for a real Quantity
+    without a pint dependency in the test suite.
+    """
+
+    def __init__(self, magnitude, units='femtogram'):
+        self.magnitude = magnitude
+        self.units = units
+        self.dimensionality = '[mass]'
+
+    def __repr__(self):  # what the bug used to persist
+        return f'<Quantity({self.magnitude}, {self.units!r})>'
 
 
 def test_sqlite_emitter_basic_run(core):
@@ -244,3 +262,33 @@ def test_sqlite_emitter_close(core):
         assert count == 1
     finally:
         conn.close()
+
+
+def test_json_default_strips_quantity_units_to_magnitude():
+    """A unit-bearing (pint.Quantity-like) leaf serializes to its bare
+    magnitude, not a "<Quantity(...)>" repr string. Regression: units-on-ports
+    mass listeners were persisted as repr strings and rendered char-by-char in
+    the Results viewer."""
+    import json
+
+    q = _FakeQuantity(0.0843286761)
+    # Direct: default() returns the magnitude, and json serializes it as a number.
+    assert _json_default(q) == 0.0843286761
+    payload = json.dumps({'mass': q}, default=_json_default)
+    assert json.loads(payload) == {'mass': 0.0843286761}
+    assert 'Quantity' not in payload
+
+
+def test_sqlite_emitter_persists_quantity_as_magnitude(core):
+    """End-to-end: a Quantity-valued observable lands in history as a float."""
+    tmp = tempfile.mkdtemp(prefix='sqlite_quantity_')
+    e = SQLiteEmitter({
+        'emit': {'global_time': 'node', 'mass': 'node'},
+        'file_path': tmp, 'simulation_id': 'sim',
+    }, core=core)
+    e.update({'global_time': 0.0, 'mass': _FakeQuantity(12.57241145)})
+    e.close()
+
+    rows = load_history(os.path.join(tmp, 'history.db'), 'sim')
+    assert rows, 'expected one emitted row'
+    assert rows[0]['mass'] == 12.57241145
