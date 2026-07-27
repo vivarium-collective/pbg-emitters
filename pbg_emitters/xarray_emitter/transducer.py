@@ -269,9 +269,10 @@ class XarrayBuffer:
                         # than crash on the shape mismatch.
                         self._write_dynamic(x_node, x_var, v_path, t_ix, val, buf_tix)
                     else:
-                        # caller-supplied coord (or time) — write directly; this
-                        # path is unchanged.
-                        self.child_vars[x_node][x_var][t_ix] = val
+                        # caller-supplied coord (or time) — write directly, but
+                        # drop the port if the value is not representable in the
+                        # numeric buffer (e.g. a colony agent's string ``id``).
+                        self._safe_write(x_node, x_var, v_path, t_ix, val)
                     emit_queue.discard(v_path)
         if len(emit_queue) and sim_tix > 0:
             raise KeyError(f"Missing emit paths: {list(emit_queue)}")
@@ -300,18 +301,36 @@ class XarrayBuffer:
         if promoted is not None:
             # already a vector variable: require a matching 1-D length
             if arr.ndim == 1 and arr.shape[0] == promoted:
-                self.child_vars[x_node][x_var][t_ix] = arr
+                self._safe_write(x_node, x_var, v_path, t_ix, arr)
             else:
                 self._drop_port(x_node, v_path, arr.shape)
             return
         if arr.ndim == 0:
             # genuine scalar — behaves exactly as the pre-fix code path
-            self.child_vars[x_node][x_var][t_ix] = val
+            self._safe_write(x_node, x_var, v_path, t_ix, val)
         elif arr.ndim == 1:
             self._promote_port(x_node, arr.shape[0], v_path, buf_tix)
-            self.child_vars[x_node][x_var][t_ix] = arr
+            self._safe_write(x_node, x_var, v_path, t_ix, arr)
         else:
             self._drop_port(x_node, v_path, arr.shape)
+
+    def _safe_write(
+        self, x_node: NodePath, x_var: str,
+        v_path: HierarchyPath, t_ix: dict[str, int], val: Any, /
+    ) -> None:
+        """Write ``val`` into a numeric output buffer, dropping the port if the
+        value is not representable there (e.g. a non-numeric leaf such as a
+        colony agent's string ``id`` wired into a numeric variable). This keeps
+        one un-representable leaf from sinking the whole run — the numeric
+        emitter simply omits that column."""
+        try:
+            self.child_vars[x_node][x_var][t_ix] = val
+        except (ValueError, TypeError):
+            try:
+                _shape = np.asarray(val).shape
+            except Exception:  # noqa: BLE001
+                _shape = ()
+            self._drop_port(x_node, v_path, _shape)
 
     def _promote_port(
         self, x_node: NodePath, length: int,
