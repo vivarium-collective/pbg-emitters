@@ -15,7 +15,9 @@ from collections import deque
 from dataclasses import replace
 from html import escape as html_escape
 from typing import Any, Mapping, final, cast
+import os
 import sys
+import time
 import warnings
 
 from xarray import DataTree
@@ -767,13 +769,93 @@ class AsyncZarrBufferWriter(AsyncBufferWriter[ZarrStore]):
         assert self.group.metadata.consolidated_metadata is None
         assert self.num_writes > 0
         if self.num_writes == 1:
-            with filter_warnings(self._warnings_eval_effect):
-                # find direct children in the Zarr hierarchy
-                self.store._members = self.store._fetch_members()
             # set appending axis
             self.store._append_dim = self.partition.time_coo_name
+            # refresh the ZarrStore member cache so the just-written,
+            # generation-specific append dimension becomes visible to
+            # `get_dimensions()` (see `_refresh_store_members`)
+            self._refresh_store_members()
             assert self.store._append_dim in self.store.get_dimensions()
         assert len(self.store.members)
+
+    # bound on the number of times `_refresh_store_members()` re-lists the Zarr
+    # group directory while waiting for the first-flush metadata to become
+    # visible, and the back-off (seconds) between successive attempts
+    _APPEND_DIM_REFRESH_ATTEMPTS: int = 12
+    _APPEND_DIM_REFRESH_BACKOFF: float = 0.02
+
+    def _refresh_store_members(self, append_dim: str | None = None) -> None:
+        r"""
+        Re-populate :py:attr:`!xarray.backends.ZarrStore._members` from storage so
+        that the generation-specific append dimension ``append_dim``
+        (defaults to the store's current ``_append_dim`` when not given)
+        (:py:attr:`.XarrayStoragePartition.time_coo_name`, a real root-level
+        coordinate array written by the *first* buffer flush) is visible to
+        :py:meth:`!xarray.backends.ZarrStore.get_dimensions`.
+
+        Root cause of the intermittent first-flush ``AssertionError`` (zarr==3.1.6)
+        --------------------------------------------------------------------------
+        The store is opened with ``cache_members=True``, so
+        :py:meth:`!ZarrStore.get_dimensions` derives its dimensions from the
+        ``_members`` snapshot, which was cached in :py:meth:`._open_store` *before*
+        the generation wrote anything. After the first buffer flush this method
+        must refresh that snapshot via
+        :py:meth:`!ZarrStore._fetch_members`, i.e.
+        ``dict(self.zarr_group.members())``.
+
+        ``Group.members()`` (with consolidated metadata hidden, as it is here) does
+        **not** read a cached view: it re-lists the group directory
+        (``LocalStore.list_dir`` → ``pathlib.Path.iterdir``) and then reads each
+        child's ``zarr.json`` concurrently on Zarr's *background event-loop thread*
+        (via :py:func:`zarr.core.sync.sync`, ``async.concurrency`` tasks gathered
+        with ``asyncio.as_completed``). The first-flush writes were performed on
+        that *same* background loop a moment earlier. There is a narrow window in
+        which a freshly created child directory has already been listed but its
+        ``zarr.json`` read still raises ``FileNotFoundError`` — zarr swallows that
+        as a ``KeyError`` and simply *drops the member from the listing* (see
+        ``zarr.core.group._iter_members``).
+
+        Crucially, in the emitter's storage layout the append dimension is carried
+        by only the root-level ``time_coo_name`` coordinate array and its paired
+        ``time_var_name`` array — every simulation data variable lives in a *child*
+        group, which :py:meth:`!ZarrStore.get_dimensions` (top-level arrays only)
+        never inspects. Those two root arrays are written together by the same
+        first flush and thus share a single visibility window: when that window
+        drops them from the listing, ``get_dimensions()`` loses ``append_dim``
+        entirely and the ``_append_dim in get_dimensions()`` assertion fails. The
+        window depends on background-loop/filesystem timing, so it fires only
+        intermittently, on the very first flush of a generation. (A flat store with
+        a data-variable array also at the root never triggers it — that array keeps
+        the dimension present even when the coordinate arrays are momentarily
+        dropped.)
+
+        Fix
+        ---
+        Sampling the listing exactly once is the bug. Re-list (bounded, with a
+        short back-off) until ``append_dim`` is actually present, so the invariant
+        is *established* rather than *sampled*. Each re-list is an authoritative
+        fresh read from storage — not a retry against a stale cache — so once the
+        child ``zarr.json`` is visible the dimension appears and the loop stops. If
+        it never appears within the bound, the metadata really is missing and the
+        caller's assertion is allowed to fire (a genuine failure, not the transient
+        one).
+        """
+        if append_dim is None:
+            append_dim = getattr(self.store, "_append_dim", None)
+        with filter_warnings(self._warnings_eval_effect):
+            for attempt in range(self._APPEND_DIM_REFRESH_ATTEMPTS):
+                # find direct children in the Zarr hierarchy (fresh listing)
+                self.store._members = self.store._fetch_members()
+                if append_dim is None or append_dim in self.store.get_dimensions():
+                    if attempt and os.environ.get("PBG_EMITTERS_DEBUG_APPEND_DIM"):
+                        print(
+                            f"[xarray_emitter] append dim {append_dim!r} became "
+                            f"visible after {attempt + 1} member re-fetch(es)",
+                            file=sys.stderr, flush=True)
+                    return
+                # brief back-off: let the first-flush `zarr.json` writes settle
+                # before re-listing the group directory
+                time.sleep(self._APPEND_DIM_REFRESH_BACKOFF)
 
     def consolidate(self) -> None:
         """
