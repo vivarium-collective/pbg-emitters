@@ -1,0 +1,31 @@
+name: Run Pytest
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+
+      # The `dev` extra carries pytest plus the parquet + xarray runtime deps the
+      # emitter tests exercise (duckdb/polars/pyarrow, xarray/zarr/pint/unum).
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run pytest
+        run: uv run pytest
