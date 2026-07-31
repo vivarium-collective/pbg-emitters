@@ -66,6 +66,11 @@ class XArrayEmitter(BufferedEmitter):
         #: Treated as an opaque JSON-serializable map — empty => no attr.
         self._provenance: dict[str, Any] = dict(config.get("provenance") or {})
         self._closed: bool = False
+        #: True once the pending (possibly partial) in-memory buffer has been
+        #: terminally flushed to the store. Shared by :py:meth:`close` and
+        #: :py:meth:`query` so the trailing buffer lands on disk exactly once —
+        #: repeated ``query()`` reads must not re-append it (idempotent read).
+        self._flushed: bool = False
 
         # Unconditionally build the transducer and writer. Tests that only
         # exercise the validator path should supply a minimum-valid transducer
@@ -188,7 +193,12 @@ class XArrayEmitter(BufferedEmitter):
         """Flush final batch, finalize the buffered base, close the writer."""
         if self._closed:
             return
-        self.flush(final=True)
+        # Terminal flush of the trailing (possibly partial) buffer — but only
+        # if a prior query() has not already done it (see `_flushed`), so the
+        # buffer is never appended to the store twice.
+        if not self._flushed:
+            self.flush(final=True)
+            self._flushed = True
         if self.writer is not None and self.writer._buffer is not None:
             if success:
                 self.writer.mark_success()
@@ -201,9 +211,31 @@ class XArrayEmitter(BufferedEmitter):
         self.close(success=success)
 
     def query(self, paths=None, query=None) -> Any:
-        """Open the written Zarr store and return an xarray DataTree."""
-        if not self._closed:
-            self.flush(final=False)
+        """Open the written Zarr store and return an xarray DataTree.
+
+        A pure, **idempotent** read: calling ``query()`` repeatedly returns the
+        same data and never mutates (grows) the store. Any rows still buffered
+        in memory when ``query()`` is first called are flushed to the store
+        **once** via the terminal (``final=True``) write path, which tolerates a
+        partial — i.e. not ``buffer_size``-aligned — buffer (it truncates rather
+        than asserting the buffer is exactly full). Subsequent calls skip the
+        flush (guarded by ``_flushed``) and simply re-open the store, so
+        resolving an emitter's results is repeatable.
+
+        Note: like ``close()``, the terminal flush finalizes the in-memory
+        buffer; the emitter is not expected to keep emitting after ``query()``.
+        The normal per-tick write path and ``close()`` semantics are unchanged.
+        """
+        if (not self._closed and not self._flushed
+                and self.transducer is not None
+                and self.transducer.buf_tix > 0):
+            # Persist the trailing (possibly partial) buffer exactly once.
+            self.flush(final=True)
+            # Await the async append so the just-written rows are on disk before
+            # the fresh reader below opens the store.
+            if self.writer is not None and self.writer._buffer is not None:
+                self.writer.future.result()
+            self._flushed = True
         import xarray as xr
         assert self.writer is not None
         tree = xr.open_datatree(self.writer.out_uri, engine="zarr")
