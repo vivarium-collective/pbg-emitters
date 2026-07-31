@@ -262,11 +262,15 @@ class XarrayBuffer:
                     raise KeyError(f"Unexpected emit path: {v_path}")
                 case (x_node, x_var):
                     spec = self.var_specs.get(x_node)
-                    if spec is not None and spec.coord is None:
-                        # generic emit-all path: this port was allocated as a
-                        # scalar (no caller-supplied coord). Lazily promote a
-                        # 1-D vector, or drop a non-representable value, rather
-                        # than crash on the shape mismatch.
+                    # Route generic emit-all ports through _write_dynamic: those
+                    # allocated as scalars (coord is None) AND those already
+                    # lazily PROMOTED to a vector (coord set, but tracked in
+                    # promoted_lengths). Promoted ports must keep going through
+                    # the dynamic path so a later length change (e.g. a colony
+                    # cell divides → the port's 1-D length changes) DROPS the
+                    # port instead of crashing the strict direct write below.
+                    if spec is not None and (spec.coord is None
+                                             or x_node in self.promoted_lengths):
                         self._write_dynamic(x_node, x_var, v_path, t_ix, val, buf_tix)
                     else:
                         # caller-supplied coord (or time) — write directly; this
@@ -296,6 +300,14 @@ class XarrayBuffer:
         Called by: :py:meth:`.write`.
         """
         arr = np.asarray(val)
+        # A NON-numeric value (a string agent id like 'a_0', or an address/config
+        # string like 'local' — as a scalar OR a vector) is not representable in
+        # the numeric-allocated generic buffer. Drop the port rather than crash on
+        # xarray's float coercion, whichever branch below it would hit. (Ports on
+        # this generic emit-all path are allocated <f8 by view_from_emit_paths.)
+        if arr.dtype.kind in ("U", "S", "O"):
+            self._drop_port(x_node, v_path, arr.shape)
+            return
         promoted = self.promoted_lengths.get(x_node)
         if promoted is not None:
             # already a vector variable: require a matching 1-D length
