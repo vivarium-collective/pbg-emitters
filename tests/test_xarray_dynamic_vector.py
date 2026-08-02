@@ -84,6 +84,50 @@ class MatrixProcess(Process):
         return {"m": np.zeros((2, 2))}
 
 
+class GrowingVecProcess(Process):
+    """Emits a 1-D vector whose LENGTH grows every tick (like a colony whose
+    cell count changes). After the port is promoted to a fixed length, a later
+    length change must DROP it (route back through the dynamic path) rather than
+    crash the strict direct write."""
+
+    config_schema = {}
+
+    def __init__(self, config=None, core=None):
+        super().__init__(config, core)
+        self._n = 2
+
+    def inputs(self):
+        return {"v": "array[float]"}
+
+    def outputs(self):
+        return {"v": "array[float]"}
+
+    def update(self, state, interval):
+        out = np.ones(self._n, dtype=float)
+        self._n += 1
+        return {"v": out}
+
+
+class StringProcess(Process):
+    """Emits a STRING scalar (e.g. a colony agent id like 'a_0') each tick.
+
+    Under the generic emit-all ("node") path the port is scalar-allocated as a
+    numeric buffer, so a non-numeric scalar is not representable — the emitter
+    must DROP it rather than crash on xarray's float coercion.
+    """
+
+    config_schema = {}
+
+    def inputs(self):
+        return {"aid": "string"}
+
+    def outputs(self):
+        return {"aid": "string"}
+
+    def update(self, state, interval):
+        return {"aid": "a_0"}
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -296,6 +340,107 @@ def test_generic_path_2d_port_dropped_with_warning(tmp_path):
         if da.ndim == 1 and da.values.size >= 6:
             scalar = da.values.ravel().tolist()
     assert scalar is not None and scalar[-1] > scalar[0]
+
+
+def test_generic_path_string_scalar_dropped_no_crash(tmp_path):
+    """A string scalar (colony agent id 'a_0') into a numeric buffer must be
+    DROPPED (warn once), not crash the run on float coercion."""
+    core = allocate_core()
+    core.register_link("Counter", Counter)
+    core.register_link("StringProcess", StringProcess)
+    from pbg_emitters.xarray_emitter import XArrayEmitter
+
+    core.register_link("XArrayEmitter", XArrayEmitter)
+
+    doc = {
+        "counter": {
+            "_type": "process", "address": "local:Counter", "config": {},
+            "inputs": {"value": ["counter_store", "value"]},
+            "outputs": {"value": ["counter_store", "value"]},
+            "interval": 1.0,
+        },
+        "agent": {
+            "_type": "process", "address": "local:StringProcess", "config": {},
+            "inputs": {"aid": ["agent_store", "aid"]},
+            "outputs": {"aid": ["agent_store", "aid"]},
+            "interval": 1.0,
+        },
+        "counter_store": {"value": 0.0},
+        "agent_store": {"aid": "a_0"},
+    }
+    composite = Composite({"state": doc}, core=core)
+
+    wires = collect_input_ports(composite.state)
+    emit_ports = [p for p in wires if p != "global_time"]
+    assert "agent_store/aid" in emit_ports
+
+    store = str(tmp_path / "str.zarr")
+    config = _base_config(store, emit_ports)
+    _inject_emitter_as_step(composite, core, config, "local:XArrayEmitter")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        composite.run(6)  # must NOT raise (pre-fix: ValueError float coercion)
+        emitter = composite.state["emitter"]["instance"]
+        try:
+            emitter.close(success=True)
+        except Exception:
+            pass
+
+    msgs = [str(w.message) for w in caught]
+    assert any("agent_store/aid" in m and "dropping" in m.lower() for m in msgs), msgs
+
+    tree = xr.open_datatree(store, engine="zarr")
+    dvars = _all_data_vars(tree)
+    for (node, _name), da in dvars.items():
+        assert "agent_store" not in node, f"dropped string port present: {node}"
+    # the numeric counter still made it through
+    scalar = None
+    for da in dvars.values():
+        if da.ndim == 1 and da.values.size >= 6:
+            scalar = da.values.ravel().tolist()
+    assert scalar is not None and scalar[-1] > scalar[0]
+
+
+def test_promoted_vector_length_change_dropped_no_crash(tmp_path):
+    """A generic port promoted to a length-N vector, then emitting a DIFFERENT
+    length (a colony cell divides), must be DROPPED — not crash the strict
+    direct write. Exercises routing promoted ports back through _write_dynamic."""
+    core = allocate_core()
+    core.register_link("GrowingVecProcess", GrowingVecProcess)
+    from pbg_emitters.xarray_emitter import XArrayEmitter
+
+    core.register_link("XArrayEmitter", XArrayEmitter)
+
+    doc = {
+        "grow": {
+            "_type": "process", "address": "local:GrowingVecProcess", "config": {},
+            "inputs": {"v": ["grow_store", "v"]},
+            "outputs": {"v": ["grow_store", "v"]},
+            "interval": 1.0,
+        },
+        "grow_store": {"v": np.ones(2, dtype=float)},
+    }
+    composite = Composite({"state": doc}, core=core)
+    wires = collect_input_ports(composite.state)
+    emit_ports = [p for p in wires if p != "global_time"]
+    assert "grow_store/v" in emit_ports
+
+    store = str(tmp_path / "grow.zarr")
+    config = _base_config(store, emit_ports)
+    _inject_emitter_as_step(composite, core, config, "local:XArrayEmitter")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        composite.run(5)  # must NOT raise once the length changes past promotion
+        emitter = composite.state["emitter"]["instance"]
+        try:
+            emitter.close(success=True)
+        except Exception:
+            pass
+
+    msgs = [str(w.message) for w in caught]
+    assert any("grow_store/v" in m and "dropping" in m.lower() for m in msgs), msgs
 
 
 def test_caller_coord_vector_still_works(tmp_path):
